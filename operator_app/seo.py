@@ -95,7 +95,7 @@ def next_due(conf, now=None):
         return None
     zone = ZoneInfo(conf["schedule"]["timezone"])
     local = (now or datetime.now(zone)).astimezone(zone)
-    published = [datetime.fromisoformat(e["published_at"]).astimezone(zone) for e in _history(conf["id"]) if e.get("status") == "published"]
+    published = [datetime.fromisoformat(e["published_at"]).astimezone(zone) for e in _history(conf["id"]) if e.get("status") == "published" and not e.get("off_schedule")]
     if published:
         day = max(published).date() + timedelta(days=conf["schedule"]["every_days"])
     else:
@@ -468,7 +468,7 @@ def _verify_existing_publication(conf, edition):
 
 
 def prepare_article(conf, record, directory, progress):
-    slot = record["run_date"]
+    slot = record.get("edition_slot", record["run_date"])
     existing = _get(conf["id"], slot)
     if existing and existing.get("draft"):
         progress({"stage": "seo-reuse", "message": "Повтор использует сохранённую статью этого выпуска"})
@@ -512,7 +512,7 @@ def prepare_article(conf, record, directory, progress):
             if section.get("table") is None:
                 section.pop("table", None)
         _json(directory / "article.json", article)
-        existing = {"status": "reviewed", "draft": draft, "context": context, "review": review, "prepared_at": storage.now_iso()}
+        existing = {"status": "reviewed", "draft": draft, "context": context, "review": review, "prepared_at": storage.now_iso(), "off_schedule": bool(record.get("off_schedule"))}
         _save(conf["id"], slot, existing)
         progress({"stage": "seo-site-validation", "message": "Проверка JSON по требованиям публикации сайта"})
     if existing.get("status") != "published":
@@ -543,7 +543,8 @@ def prepare_article(conf, record, directory, progress):
 
 
 def publish_article(conf, record, sources, root, progress):
-    edition = _get(conf["id"], record["run_date"])
+    slot = record.get("edition_slot", record["run_date"])
+    edition = _get(conf["id"], slot)
     if not edition or not edition.get("draft"):
         raise ValueError("Отсутствует сохранённый выпуск статьи")
     article = edition["draft"]["article"]
@@ -583,7 +584,7 @@ def publish_article(conf, record, sources, root, progress):
         raise ValueError("Изменения переданы сайту, но опубликованный HTML ещё не подтверждён. Повтор использует ту же статью.") from None
     edition.update(status="published", publication=published)
     edition.setdefault("published_at", storage.now_iso())
-    _save(conf["id"], record["run_date"], edition)
+    _save(conf["id"], slot, edition)
     _json(root / "Публикация.json", published)
     progress({"stage": "seo-complete", "message": "Публичная статья подтверждена HTTP-проверкой"})
     return {"status": "completed", "report": f"Опубликована статья: {article['title']}\n{expected_url}\nSEO-запрос: {edition['draft']['primaryKeyword']}\nФакты и новый интент проверены. Выпуск: {published['release']}",

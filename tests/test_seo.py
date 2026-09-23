@@ -318,3 +318,47 @@ def test_cms_runtime_manifest_without_static_release_can_verify_existing_article
     result = seo._verify_existing_publication(conf(), edition)
     assert result['release'] == 'verified-live'
     assert result['article'] == normalized
+
+
+def test_off_schedule_edition_does_not_shift_planned_publication(isolated):
+    c = conf()
+    c['enabled'] = True
+    seo._save(c['id'], '2026-09-23', {'status': 'published', 'published_at': '2026-09-23T12:00:00+03:00'})
+    before = seo.next_due(c)
+    seo._save(c['id'], 'manual:replacement', {'status': 'published', 'published_at': '2026-09-25T14:00:00+03:00', 'off_schedule': True})
+    assert seo.next_due(c) == before
+
+
+def test_manual_edition_retry_uses_own_text_and_cover(isolated, monkeypatch):
+    draft, context = content()
+    c = conf()
+    review = {'approved': True}
+    image = {'path': str(isolated / 'cover.png'), 'sha256': '1' * 64}
+    planned = {'status': 'published', 'draft': {'article': {'slug': 'previous-post'}}}
+    seo._save(c['id'], '2026-09-23', planned)
+    seo._save(c['id'], 'manual:replacement', {'status': 'prepared', 'draft': draft, 'context': context, 'review': review, 'image': image, 'off_schedule': True})
+    monkeypatch.setattr(seo, 'inspect_cover', lambda path: {'sha256': '1' * 64})
+    monkeypatch.setattr(seo, '_run_json', lambda *args: {'valid': True, 'slug': draft['article']['slug']})
+    monkeypatch.setattr(seo, '_generate', lambda *args, **kwargs: pytest.fail('Retry must reuse text and cover'))
+    directory = isolated / 'retry'; directory.mkdir()
+    record = {'run_date': '2026-09-23', 'edition_slot': 'manual:replacement', 'off_schedule': True}
+    sources = seo.prepare_article(c, record, directory, lambda event: None)
+    assert sources[0]['image_path'] == image['path']
+    assert json.loads(Path(sources[0]['path']).read_text()) == draft['article']
+    assert seo._get(c['id'], '2026-09-23') == planned
+    assert seo._get(c['id'], record['edition_slot'])['off_schedule'] is True
+
+
+def test_manual_edition_submit_has_stable_key(isolated, monkeypatch):
+    c = conf()
+    monkeypatch.setattr(engine, 'get_operator', lambda ident: c)
+    monkeypatch.setattr(engine.POOL, 'submit', lambda *args: None)
+    first = engine.submit(c['id'], edition_key='replacement-20260923')
+    assert first['edition_slot'] == 'manual:replacement-20260923'
+    assert first['off_schedule'] is True
+    first['status'] = 'failed'; storage.save_run(first)
+    retry = engine.submit(c['id'], edition_key='replacement-20260923')
+    assert retry['edition_slot'] == first['edition_slot']
+    assert retry['id'] != first['id']
+    with pytest.raises(ValueError):
+        engine.submit(c['id'], edition_key='replacement', trigger='schedule')

@@ -9,6 +9,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import zipfile
@@ -73,8 +74,11 @@ def seo_download(conf, record, directory, progress):
 HANDLERS["seo"] = seo_download
 
 
-def submit(ident="glopro", run_date=None, trigger="manual", uploads=None):
+def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edition_key=None):
     conf = get_operator(ident)
+    if edition_key is not None and (conf["kind"] != "seo" or trigger != "manual" or run_date is not None
+                                    or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", edition_key)):
+        raise ValueError("Внеплановый выпуск: нужен SEO-оператор и постоянный edition_key без run_date")
     if conf["kind"] not in HANDLERS or conf["kind"] not in PROCESSORS:
         raise ValueError("Для этого оператора ещё не подключены получение и обработка результатов")
     scheduled_date = date.fromisoformat(run_date) if run_date else latest_run_date()
@@ -87,7 +91,7 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None):
             raise ValueError("SEO: допускается только актуальный выпуск; старые статьи не публикуются пачкой")
         from .seo import _get as seo_edition, next_due as seo_next_due
         due = seo_next_due({**conf, "enabled": True})
-        if not seo_edition(conf["id"], str(scheduled_date)) and due and due.date() > today:
+        if edition_key is None and not seo_edition(conf["id"], str(scheduled_date)) and due and due.date() > today:
             raise ValueError("SEO: предыдущая статья уже опубликована; следующий выпуск " + due.date().isoformat())
     if not run_date and conf["kind"] == "yandex":
         while scheduled_date.weekday() != 1:
@@ -106,6 +110,9 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None):
         if active:
             raise ValueError("Дождитесь завершения текущего запуска")
         record = storage.create_run(ident, scheduled_date, start, end, trigger)
+        if edition_key is not None:
+            record.update(edition_key=edition_key, edition_slot="manual:" + edition_key, off_schedule=True)
+            storage.save_run(record)
         # Snapshot now: edits made during a queued/running job apply next time.
         POOL.submit(execute, conf, record, uploads)
     return record
