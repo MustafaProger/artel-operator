@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#196b4d" />
+    <title>Артель — Оператор</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="/static/panels.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Перейти к содержимому</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Главное меню">
+        <a class="brand" href="#overview" aria-label="Артель — обзор">
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M7 25 16 6l9 19M11 18h10"/><circle cx="25" cy="7" r="2"/></svg></span>
+          <span class="brand-copy">артель<span>ОПЕРАТОР</span></span>
+        </a>
+        <span class="sidebar-label">ПРОСТРАНСТВО АВТОМАТИЗАЦИИ</span>
+        <nav class="main-nav">
+          <a href="#overview" data-view="overview"><span data-icon="dashboard"></span><span class="nav-label">Обзор</span></a>
+          <a href="#operators" data-view="operators"><span data-icon="layers"></span><span class="nav-label">Операторы</span><span class="nav-count" id="operator-count">—</span></a>
+          <a href="#runs" data-view="runs" data-history-filter="all"><span data-icon="history"></span><span class="nav-label">История</span></a>
+          <a href="#instructions" data-view="instructions"><span data-icon="document"></span><span class="nav-label">Инструкции</span></a>
+          <a href="#settings" data-view="settings"><span data-icon="settings"></span><span class="nav-label">Подключения</span></a>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-indicator"><span class="status-dot" id="server-dot"></span><span id="server-label">Подключаемся…</span></div>
+          <p>Меньше рутины.<br /><span>Больше важного.</span></p>
+          <div class="workspace-profile"><span>А</span><div>Артель<small>Локальное пространство</small></div></div>
+        </div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div class="breadcrumb"><span class="breadcrumb-root">Рабочее пространство</span><span>/</span><strong id="page-label">Обзор</strong></div>
+          <div class="topbar-right"><span class="today" id="today"></span><a class="connection-badge" id="connection-badge" href="#settings"><span class="status-dot"></span>Проверяем подключение</a></div>
+        </header>
+
+        <main id="main-content" tabindex="-1">
+          <div class="global-error" id="global-error" hidden role="alert"><span id="global-error-text"></span><button class="text-button" id="retry-state" type="button">Повторить</button></div>
+
+          <section class="page-section" id="view-overview" aria-labelledby="overview-title">
+            <div class="page-heading overview-heading"><div><div class="eyebrow"><span class="eyebrow-line"></span>ВАШ ЦЕНТР АВТОМАТИЗАЦИИ</div><h1 id="overview-title">Рабочий ритм<span class="title-dot">.</span></h1><p>Процессы, отчёты и результаты. Всё на своих местах.</p></div><div class="button-row"><button class="button button-secondary" type="button" data-action="import"><span data-icon="upload"></span>Импорт Excel</button><button class="button button-primary" type="button" data-action="manual-run"><span data-icon="play"></span>Запустить</button></div></div>
+
+            <div class="overview-grid">
+              <article class="schedule-card">
+                <div class="card-eyebrow"><span class="light-icon" data-icon="calendar"></span>БЛИЖАЙШИЙ ЗАПУСК<span class="schedule-chip">МСК</span></div>
+                <div class="schedule-time"><span id="next-run-time">—:—</span><div id="next-run-date">Загружаем расписание</div></div>
+                <div class="schedule-bottom"><div><span class="schedule-caption" id="next-run-name">Оператор GloPro</span><p id="next-run-period">Вторник и пятница</p></div><a class="schedule-arrow" href="#operators" aria-label="Посмотреть расписание операторов"><span data-icon="arrow-up-right"></span></a></div>
+                <div class="schedule-art" aria-hidden="true"><i></i><i></i><i></i></div>
+              </article>
+              <article class="metric-card"><div class="metric-topline"><h2>Готовые расчёты</h2><div class="metric-icon" data-icon="check-circle"></div></div><span class="metric-value" id="completed-count">—</span><p>В загруженной истории</p><div class="activity-track" id="activity-track" role="img" aria-label="История запусков загружается"></div><a href="#runs" data-history-filter="success" class="card-link">Готовые результаты<span data-icon="arrow-up-right"></span></a></article>
+              <article class="metric-card attention-card"><div class="metric-topline"><h2>Требуют внимания</h2><div class="metric-icon amber" data-icon="attention"></div></div><span class="metric-value" id="attention-count">—</span><p id="attention-description">Ошибки и результаты,<br />которые нужно проверить</p><a href="#runs" data-history-filter="attention" class="card-link">Проверить запуски<span data-icon="arrow-up-right"></span></a></article>
+            </div>
+
+            <div class="section-heading"><div><h2>Операторы <span class="quiet-count" id="operators-summary-count">—</span></h2><p>Ваши правила. Автоматическое выполнение.</p></div><a class="text-button" href="#operators">Управление<span data-icon="arrow-right"></span></a></div>
+            <div id="overview-operators" class="operator-list"><div class="loading-panel"><span class="spinner"></span>Загружаем операторов…</div></div>
+
+            <div class="section-heading recent-heading"><div><h2>Последние запуски</h2><p>У каждого запуска — свой период и комплект файлов.</p></div><a class="text-button" href="#runs" data-history-filter="all">Вся история<span data-icon="arrow-right"></span></a></div>
+            <div id="recent-runs" class="runs-container"><div class="loading-panel"><span class="spinner"></span>Загружаем историю…</div></div>
+            <div class="overview-footnote"><span data-icon="info"></span><span>Автозапуск работает, пока приложение запущено и Mac не спит. Готовые файлы сохраняются в истории.</span></div>
+          </section>
+
+          <section class="page-section" id="view-operators" hidden aria-labelledby="operators-title">
+            <div class="page-heading"><div><div class="eyebrow">ПРОЦЕССЫ АРТЕЛЬ</div><h1 id="operators-title">Ваши операторы</h1><p>Автозапуск работает, когда оператор включён, приложение запущено и Mac не спит.</p></div><button class="button button-primary" id="create-operator-button" type="button"><span data-icon="plus"></span>Добавить оператора</button></div>
+            <div id="all-operators" class="operator-list"></div>
+            <div class="process-grid">
+              <article class="note-card"><span class="note-icon" data-icon="calendar"></span><h3>Вторник</h3><p>Расчёт за пятницу, субботу, воскресенье и понедельник.</p><span class="note-tag">Четыре завершённых дня</span></article>
+              <article class="note-card"><span class="note-icon" data-icon="calendar"></span><h3>Пятница</h3><p>Расчёт за вторник, среду и четверг.</p><span class="note-tag">Три завершённых дня</span></article>
+              <article class="note-card"><span class="note-icon" data-icon="document"></span><h3>Правила в Markdown</h3><p>Меняйте параметры и текст инструкции в редакторе. Новый вид процесса требует своего обработчика.</p><a class="card-link" href="#instructions">Открыть инструкции<span data-icon="arrow-right"></span></a></article>
+            </div>
+          </section>
+
+          <section class="page-section" id="view-runs" hidden aria-labelledby="runs-title">
+            <div class="page-heading"><div><div class="eyebrow">ЖУРНАЛ РАБОТЫ</div><h1 id="runs-title">История запусков</h1><p>Исходные данные, расчёты и файлы за каждый период.</p></div><div class="button-row"><button class="button button-secondary" type="button" data-action="import"><span data-icon="upload"></span>Импорт Excel</button><button class="button button-primary" type="button" data-action="manual-run"><span data-icon="play"></span>Запустить</button></div></div>
+            <div class="filter-row"><label class="search-input"><span data-icon="search"></span><input id="run-search" type="search" placeholder="Поиск по периоду или оператору" aria-label="Поиск запусков" /></label><select id="run-filter" aria-label="Статус запуска"><option value="all">Все статусы</option><option value="success">Готовые</option><option value="active">В работе</option><option value="attention">Требуют внимания</option></select></div>
+            <div id="all-runs" class="runs-container"></div>
+          </section>
+
+          <section class="page-section" id="view-instructions" hidden aria-labelledby="instructions-title">
+            <div class="page-heading"><div><div class="eyebrow">ВАШИ ПРАВИЛА</div><h1 id="instructions-title">Инструкции</h1><p>Понятные правила, сохранённые в обычном Markdown-файле.</p></div></div>
+            <div class="editor-layout">
+              <article class="editor-panel"><div class="editor-toolbar"><label for="editor-operator">Оператор</label><select id="editor-operator" aria-label="Оператор для редактирования"></select><span class="editor-format">.md</span></div><label for="markdown-editor" class="sr-only">Инструкция в Markdown</label><textarea id="markdown-editor" spellcheck="false" placeholder="Выберите оператора, чтобы открыть инструкцию."></textarea><div class="editor-footer"><span id="editor-status">Нет несохранённых изменений</span><div class="button-row"><button class="button button-secondary button-small" id="editor-reset" type="button">Отменить</button><button class="button button-primary button-small" id="editor-save" type="button" disabled>Сохранить</button></div></div></article>
+              <aside class="instruction-help"><span class="note-icon" data-icon="document"></span><h2>Как это устроено</h2><p>Параметры в заголовке YAML задают расписание и правила расчёта. enabled: false выключает автозапуск; ручной запуск остаётся доступен.</p><div class="help-divider"></div><h3>Текст ниже заголовка</h3><p>Markdown хранит описание процесса и прикладывается к запуску. Произвольный текст сам по себе не создаёт новую автоматизацию.</p><div class="help-divider"></div><h3>Изменения сохраняются для следующих запусков</h3><p>Результаты предыдущих расчётов остаются в истории вместе с использованной инструкцией.</p></aside>
+            </div>
+          </section>
+
+          <section class="page-section" id="view-settings" hidden aria-labelledby="settings-title">
+            <div class="page-heading"><div><div class="eyebrow">ИСТОЧНИКИ ДАННЫХ</div><h1 id="settings-title">Подключения</h1><p>Подключения к кабинетам поставщиков и получение отчётов.</p></div></div>
+            <div class="settings-layout"><article class="settings-panel"><div class="panel-heading"><span class="provider-logo">Glo<span>Pro</span></span><span id="settings-connection-status" class="badge badge-neutral">Не проверено</span></div><form id="connection-form"><label class="field-label" for="connection-username">Логин</label><input id="connection-username" name="username" autocomplete="username" placeholder="Логин в GloPro" required /><label class="field-label" for="connection-password">Пароль</label><input id="connection-password" name="password" type="password" autocomplete="current-password" placeholder="Пароль в GloPro" required /><p class="field-hint">Данные доступа хранятся локально в файле с ограниченным доступом, без шифрования. Пароль не возвращается в интерфейс и не добавляется в инструкции.</p><div class="button-row settings-actions"><button class="button button-primary" id="connection-save" type="submit">Сохранить доступ</button><button class="button button-secondary" id="connection-test" type="button">Проверить вход</button></div><div id="connection-result" class="inline-message" hidden role="status"></div></form><p class="field-hint">Автозапуск на Mac: оператор включён, приложение работает, Mac не спит.</p></article><aside class="instruction-help"><span class="note-icon" data-icon="link"></span><h2>Один раз подключить</h2><p>Проверка подтверждает вход в кабинет. Автозапуск включается отдельно в инструкции оператора.</p><div class="help-divider"></div><h3>Если кабинет недоступен</h3><p>Загрузите выгрузки Excel вручную. Они пройдут через тот же расчёт и останутся в истории запусков.</p><button class="button button-secondary" type="button" data-action="import"><span data-icon="upload"></span>Импортировать файлы</button><div class="help-divider"></div><h3>Работа по расписанию</h3><p>Приложение должно работать, а Mac — быть включённым и не находиться в режиме сна. Оператор должен быть включён; время указывается по Москве.</p></aside></div>
+            <div class="settings-layout integration-layout">
+              <article class="settings-panel"><div class="panel-heading"><h2>Яндекс Заправки</h2><span id="yandex-status" class="badge badge-neutral">Не подключён</span></div>
+                <p>Недельные отчёты по всем сотрудникам с заправками: каждый вторник в 07:00 МСК за предыдущие вторник–понедельник. Новые сотрудники добавляются автоматически.</p>
+                <p class="field-hint">Один раз войдите в ООО «НК АРТЭЛЬ» в отдельном окне «Google Chrome для тестирования». После входа окно закроется, а приложение сохранит сессию для следующих выгрузок. Пароль в приложение вводить не нужно.</p>
+                <div class="button-row settings-actions"><button id="yandex-connect" type="button" class="button button-primary">Подключить Яндекс</button><button type="button" class="button button-secondary" data-run-operator="yandex">Подготовить отчёт</button></div>
+                <div id="yandex-result" class="inline-message" role="status" hidden></div>
+              </article>
+              <aside class="instruction-help"><h2>По вашему шаблону</h2><p>Отдельный файл «Яндекс. Имя.xlsx» для каждого сотрудника с заправками. При совпадении имён в название добавляется ID. В тексте — период, литры и сумма закупки на склад.</p><p>Проверяются все страницы заказов недели, ID сотрудников и каждая строка Excel. Подтверждённые пустые выборки пропускаются; ошибка загрузки останавливает расчёт.</p><p>Если Яндекс попросит повторный вход, нажмите «Подключить Яндекс». До восстановления доступа можно импортировать готовые выгрузки. Импорт проверяет переданные файлы; полноту недели подтверждает автоматический запуск.</p><button class="button button-secondary" type="button" data-action="import" data-import-operator="yandex">Импортировать Яндекс</button></aside>
+            </div>
+          </section>
+        </main>
+        <footer class="workspace-footer"><span>Артель Оператор</span><span>Часовой пояс: Москва · UTC+3</span></footer>
+      </div>
+    </div>
+
+    <dialog id="run-dialog" class="modal">
+      <div class="modal-heading"><div><span class="eyebrow">РУЧНОЙ ЗАПУСК</span><h2>Подготовить отчёт</h2></div><button type="button" class="icon-button" data-close="run-dialog" aria-label="Закрыть"><span data-icon="close"></span></button></div>
+      <form id="run-form"><label class="field-label" for="run-operator">Оператор</label><select id="run-operator" required></select><label class="field-label" for="run-date">Дата планового запуска</label><input id="run-date" type="date" required /><p class="field-hint" id="run-period-preview">Выберите вторник или пятницу. Отчёт охватит дни перед выбранной датой.</p><div class="modal-note"><span data-icon="info"></span>Оператор скачает выгрузки и подготовит пакет файлов. Готовый результат появится в истории.</div><div id="run-form-error" class="inline-message error" hidden role="alert"></div><div class="modal-actions"><button class="button button-secondary" type="button" data-close="run-dialog">Отмена</button><button class="button button-primary" id="run-submit" type="submit"><span data-icon="play"></span>Запустить расчёт</button></div></form>
+    </dialog>
+
+    <dialog id="import-dialog" class="modal">
+      <div class="modal-heading"><div><span class="eyebrow">ИЗ ВАШИХ ФАЙЛОВ</span><h2>Импорт выгрузок</h2></div><button type="button" class="icon-button" data-close="import-dialog" aria-label="Закрыть"><span data-icon="close"></span></button></div>
+      <form id="import-form"><label class="field-label" for="import-operator">Источник отчётов</label><select id="import-operator" required></select><label class="drop-zone" id="import-drop-zone" for="import-files"><span data-icon="upload"></span><strong>Выберите файлы Excel</strong><span>или перетащите их сюда</span><small>.xlsx · до 30 МБ на файл</small><input id="import-files" type="file" multiple accept=".xlsx" required /></label><ul class="selected-files" id="selected-files"></ul><label class="field-label" for="import-date">Дата планового запуска</label><input id="import-date" type="date" required /><p class="field-hint" id="import-period-preview"></p><div id="import-form-error" class="inline-message error" hidden role="alert"></div><div class="modal-actions"><button class="button button-secondary" type="button" data-close="import-dialog">Отмена</button><button class="button button-primary" id="import-submit" type="submit">Загрузить и рассчитать</button></div></form>
+    </dialog>
+
+    <dialog id="create-dialog" class="modal modal-wide">
+      <div class="modal-heading"><div><span class="eyebrow">НОВЫЙ ПРОЦЕСС</span><h2>Добавить оператора</h2></div><button type="button" class="icon-button" data-close="create-dialog" aria-label="Закрыть"><span data-icon="close"></span></button></div>
+      <form id="create-form"><label class="field-label" for="create-id">Идентификатор</label><input id="create-id" placeholder="Например, supplier-reports" pattern="[a-z][a-z0-9_-]{0,59}" maxlength="60" required /><p class="field-hint">До 60 символов: строчные латинские буквы, цифры, дефис или подчёркивание. Первый символ — буква.</p><label class="field-label" for="create-markdown">Инструкция Markdown</label><textarea id="create-markdown" class="create-markdown" spellcheck="false" required></textarea><div class="modal-note"><span data-icon="info"></span>Сейчас доступны обработчики GloPro и Яндекс Заправок. Для другого процесса нужен отдельный обработчик. Одной инструкции для его запуска недостаточно.</div><div id="create-form-error" class="inline-message error" hidden role="alert"></div><div class="modal-actions"><button class="button button-secondary" type="button" data-close="create-dialog">Отмена</button><button class="button button-primary" id="create-submit" type="submit">Создать оператора</button></div></form>
+    </dialog>
+
+    <dialog id="details-dialog" class="modal detail-modal"><div class="modal-heading"><div><span class="eyebrow">РЕЗУЛЬТАТ ЗАПУСКА</span><h2 id="details-title">Отчёт</h2></div><button type="button" class="icon-button" data-close="details-dialog" aria-label="Закрыть"><span data-icon="close"></span></button></div><div id="run-details"></div></dialog>
+    <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+services:
+  operator:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - '127.0.0.1:8790:8790'
+    volumes:
+      - ./data:/app/data
+      - ./operators:/app/operators
+    environment:
+      TZ: Europe/Moscow
+    shm_size: '1gb'
