@@ -330,7 +330,7 @@
 
   function updatePeriodPreview() {
     const kind = selectedKind('run-operator');
-    if (kind === 'seo') { $('run-period-preview').textContent = 'Одна новая статья в актуальном четырёхдневном выпуске. Повтор использует сохранённый текст и не создаёт дубликат.'; return; }
+    if (kind === 'seo') { $('run-period-preview').textContent = 'Одна новая статья в актуальном четырёхдневном выпуске. Новая обложка и статья сохраняются в CMS. Повтор использует тот же текст и изображение.'; return; }
     const period = periodForDate($('run-date').value, kind);
     if (!period) {
       $('run-period-preview').textContent = kind === 'yandex' ? 'Выберите вторник: отчёт за предыдущие вторник–понедельник.' : 'Выберите вторник или пятницу. Отчёт охватит дни перед выбранной датой.';
