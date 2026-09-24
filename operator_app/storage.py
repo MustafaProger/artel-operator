@@ -39,11 +39,19 @@ def db():
         conn.close()
 
 
-def create_run(operator_id, run_date, start, end, trigger):
+def create_run(operator_id, run_date, start, end, trigger, *, require_idle=False, edition_key=None):
     record = dict(id=uuid.uuid4().hex, operator_id=operator_id, run_date=str(run_date), trigger=trigger,
                   period_start=str(start), period_end=str(end), status="queued", created_at=now_iso(),
                   finished_at=None, error=None, files=[], report="", events=[])
+    if edition_key is not None:
+        record.update(edition_key=edition_key, edition_slot="manual:" + edition_key, off_schedule=True)
     with db() as conn:
+        if require_idle:
+            # Reserve before reading: two connections cannot both observe an idle
+            # executor and enqueue work. History pagination is only for the UI.
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM runs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+                raise ValueError("Дождитесь завершения текущего запуска")
         conn.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?)", (record["id"], operator_id, str(run_date), trigger, "queued", record["created_at"], json.dumps(record)))
     return record
 

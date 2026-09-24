@@ -106,15 +106,17 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edi
     else:
         start, end = period_for(scheduled_date)
     with SUBMIT_LOCK:
-        active = [r for r in storage.runs() if r["status"] in ("running", "queued")]
-        if active:
-            raise ValueError("Дождитесь завершения текущего запуска")
-        record = storage.create_run(ident, scheduled_date, start, end, trigger)
-        if edition_key is not None:
-            record.update(edition_key=edition_key, edition_slot="manual:" + edition_key, off_schedule=True)
-            storage.save_run(record)
+        record = storage.create_run(ident, scheduled_date, start, end, trigger,
+                                    require_idle=True, edition_key=edition_key)
         # Snapshot now: edits made during a queued/running job apply next time.
-        POOL.submit(execute, conf, record, uploads)
+        try:
+            POOL.submit(execute, conf, record, uploads)
+        except Exception:
+            # A rejected dispatch must not leave a permanent queued reservation.
+            record.update(status="failed", finished_at=storage.now_iso(),
+                          error="Не удалось передать запуск исполнителю. Доступен ручной повтор.")
+            storage.save_run(record)
+            raise
     return record
 
 
@@ -380,9 +382,6 @@ PROCESSORS["seo"] = process_seo
 def execute(conf, record, uploads=None):
     root = DATA / "runs" / record["id"]
     originals = root / ("Файлы по фирмам" if conf["kind"] == "glopro" else "Исходные файлы")
-    originals.mkdir(parents=True, exist_ok=True)
-    record["status"] = "running"
-    storage.save_run(record)
 
     def progress(event):
         record["events"].append({"at": storage.now_iso(), **event})
@@ -390,6 +389,9 @@ def execute(conf, record, uploads=None):
 
     with RUN_LOCK:
         try:
+            originals.mkdir(parents=True, exist_ok=True)
+            record["status"] = "running"
+            storage.save_run(record)
             (root / "Инструкция.md").write_text(conf["markdown"], encoding="utf-8")
             if uploads is not None:
                 sources = []
@@ -433,11 +435,18 @@ def execute(conf, record, uploads=None):
             record["error"] = str(exc) if isinstance(exc, ValueError) else "Сбой выполнения. Проверьте подключение и исходные файлы; доступен повтор."
         finally:
             record["finished_at"] = storage.now_iso()
-            record["files"] = [_file(record, p, root) for p in sorted(root.rglob("*"), key=(lambda p: alphabet_key(p.relative_to(root))) if conf["kind"] == "yandex" else None) if p.is_file()]
-            storage.save_run(record)
-            if uploads:
-                for upload in uploads:
-                    Path(upload["path"]).unlink(missing_ok=True)
+            try:
+                record["files"] = [_file(record, p, root) for p in sorted(root.rglob("*"), key=(lambda p: alphabet_key(p.relative_to(root))) if conf["kind"] == "yandex" else None) if p.is_file()]
+            except OSError:
+                # Failure to read an artifact must not strand a running job.
+                record.update(status="failed", files=[],
+                              error="Не удалось проверить файлы результата. Проверьте доступ к каталогу запуска; доступен ручной повтор.")
+            try:
+                storage.save_run(record)
+            finally:
+                if uploads:
+                    for upload in uploads:
+                        Path(upload["path"]).unlink(missing_ok=True)
 
 
 def tick(now=None):

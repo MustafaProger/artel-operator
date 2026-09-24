@@ -10,16 +10,27 @@ def sort_report_sections(text):
     sections = _sections(text)
     if not sections:
         return text
-    prefix = text[:sections[0][1]]
-    blocks = [text[start:end] for _, start, end in sections]
-    blocks.sort(key=lambda block: alphabet_key(block.splitlines()[0].lstrip("# ")))
-    return prefix + "".join(block if block.endswith("\n\n") else block + ("\n" if block.endswith("\n") else "\n\n") for block in blocks)
+    result, position, first = [], 0, 0
+    for index, (_, _, end) in enumerate(sections):
+        if index + 1 < len(sections) and end == sections[index + 1][1]:
+            continue
+        # Sort only adjacent company sections. Higher-level headings and their
+        # manual text keep their position instead of moving with a company.
+        result.append(text[position:sections[first][1]])
+        blocks = [text[start:stop] for _, start, stop in sections[first:index + 1]]
+        blocks.sort(key=lambda block: alphabet_key(block.splitlines()[0].lstrip("# ")))
+        result.extend(block if block.endswith("\n\n") else block + ("\n" if block.endswith("\n") else "\n\n") for block in blocks)
+        position, first = end, index + 1
+    result.append(text[position:])
+    return "".join(result)
 
 
 def _sections(text):
-    headings = list(re.finditer(r"(?m)^###[ \t]+([^\r\n]+)\r?\n", text))
-    return [(company_identity(match[1]), match.start(), headings[index + 1].start() if index + 1 < len(headings) else len(text))
-            for index, match in enumerate(headings)]
+    # A company ends at the next peer or parent heading; deeper headings remain
+    # part of its report and are replaced along with the company's content.
+    headings = list(re.finditer(r"(?m)^(#{1,3})[ \t]+([^\r\n]+)(?:\r?\n|$)", text))
+    return [(company_identity(match[2]), match.start(), headings[index + 1].start() if index + 1 < len(headings) else len(text))
+            for index, match in enumerate(headings) if match[1] == "###"]
 
 
 def update_report_sections(existing: str, incoming: str) -> str:
