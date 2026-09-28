@@ -105,11 +105,11 @@ def next_due(conf, now=None):
     return datetime.combine(day, time.fromisoformat(conf["schedule"]["time"]), zone)
 
 
-def _run_json(command, cwd, timeout, label, input_text=None):
+def _run_json(command, cwd, timeout, label, input_text=None, extra_env=None):
     try:
         result = subprocess.run(command, cwd=cwd, input=input_text, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-                                env={**os.environ, "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"})
+                                env={**os.environ, "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin", **(extra_env or {})})
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError(f"{label}: процесс недоступен или превышено время ожидания. Доступен повтор.") from exc
     if result.returncode:
@@ -132,7 +132,9 @@ def _run_json(command, cwd, timeout, label, input_text=None):
 
 def collect_context(conf):
     site = Path(conf["site_root"])
-    raw = _run_json([conf["node_path"], str(site / "scripts/editorial-context.mjs")], site, 90, "Контекст сайта")
+    environment = {"RUSPLAST_NETWORK_INTERFACE": conf["network_interface"]} if conf.get("network_interface") else None
+    kwargs = {"extra_env": environment} if environment else {}
+    raw = _run_json([conf["node_path"], str(site / "scripts/editorial-context.mjs")], site, 90, "Контекст сайта", **kwargs)
     if not isinstance(raw, dict) or raw.get("source") != "strapi" or not isinstance(raw.get("articles"), list):
         raise ValueError("Контекст сайта: нужны актуальные статьи из Strapi CMS")
     # Old marketing descriptions include unsafe blanket fire claims. They are
@@ -156,28 +158,59 @@ def collect_context(conf):
                          "searchIntent": e.get("draft", {}).get("searchIntent"), "status": e.get("status")} for e in _history(conf["id"])]}
 
 
+def _codex_executable(configured):
+    """Support both bundled CLI layouts without selecting an unrelated install."""
+    path = Path(configured)
+    candidates = [path]
+    layouts = ("Contents/Resources/codex", "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+    for layout in layouts:
+        suffix = "/" + layout
+        if str(path).endswith(suffix):
+            bundle = str(path)[:-len(suffix)]
+            candidates.extend(Path(bundle) / other for other in layouts if other != layout)
+            break
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    raise ValueError("Codex: исполняемый файл не найден или недоступен. Проверьте codex_path в инструкции оператора и установку приложения.")
+
+
 def _generate(conf, directory, prompt, schema, name, *, image_path=None, image_generation=False):
+    executable = _codex_executable(conf["codex_path"])
     schema_path = directory / f"{name}-schema.json"
     output_path = directory / f"{name}.json"
     _json(schema_path, schema)
     output_path.unlink(missing_ok=True)
     # Ignore personal model/tool overrides, use the current account default.
     # Read-only sandbox: neither generation nor review has deployment rights.
-    command = [conf["codex_path"], "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
+    command = [executable, "exec", "--ignore-user-config", "--ephemeral", "--skip-git-repo-check",
                "--sandbox", "read-only", "--color", "never", "-C", str(directory),
                "--output-schema", str(schema_path), "-o", str(output_path), "-"]
     if image_generation:
         command[2:2] = ["--enable", "image_generation"]
     if image_path:
         command[-1:-1] = ["--image", str(image_path)]
-    try:
-        result = subprocess.run(command, input=prompt, text=True, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=conf.get("image_generation_timeout", 900) if image_generation else conf.get("generation_timeout", 720),
-                                env={**os.environ, "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"})
-    except (OSError, subprocess.TimeoutExpired):
-        raise ValueError("Codex: генерация не завершена. Проверьте вход ChatGPT и доступность сервиса; доступен повтор.") from None
+    # CLI diagnostics can contain provider details. Keep them outside run files
+    # (which are downloadable), including output emitted before a timeout.
+    logs = storage.DATA / "logs"
+    logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log_path = logs / "seo-generation.log"
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    timeout = conf.get("image_generation_timeout", 900) if image_generation else conf.get("generation_timeout", 720)
+    with os.fdopen(fd, "w", encoding="utf-8") as log:
+        os.fchmod(log.fileno(), 0o600)
+        log.write(f"{storage.now_iso()} stage={name} executable={executable}\n")
+        log.flush()
+        try:
+            result = subprocess.run(command, input=prompt, text=True, stdout=subprocess.DEVNULL,
+                                    stderr=log, timeout=timeout,
+                                    env={**os.environ, "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"})
+        except subprocess.TimeoutExpired:
+            raise ValueError(f"Codex: превышено время генерации ({timeout} с). Доступен повтор. Диагностика: data/logs/seo-generation.log") from None
+        except OSError:
+            raise ValueError("Codex: не удалось запустить исполняемый файл. Проверьте codex_path и права доступа.") from None
     if result.returncode or not output_path.is_file():
-        raise ValueError("Codex: не получен ответ. Проверьте вход ChatGPT и лимиты; доступен повтор.")
+        raise ValueError("Codex: не получен ответ. Проверьте вход ChatGPT и лимиты; доступен повтор. Диагностика: data/logs/seo-generation.log")
     try:
         value = json.loads(output_path.read_text(encoding="utf-8"))
     except ValueError:
@@ -362,7 +395,7 @@ def _verify_links(article, conf):
         url = conf["site_url"] + href if href.startswith("/") else href
         if urlparse(url).netloc != urlparse(conf["site_url"]).netloc or urlparse(url).scheme != "https":
             raise ValueError("Источник вне разрешённого сайта")
-        body = _public_html(url)
+        body = _public_html(url, conf["network_interface"]) if conf.get("network_interface") else _public_html(url)
         # SPA catch-all 200 must not count as a valid product/article.
         path = urlparse(url).path.rstrip("/")
         if path and path != "/" and path not in body:
@@ -371,9 +404,15 @@ def _verify_links(article, conf):
     return checks
 
 
-def _public_html(url):
+def _public_html(url, network_interface=None):
     for attempt in range(3):
         try:
+            if network_interface:
+                result = subprocess.run(["/usr/bin/curl", "--interface", network_interface, "--fail", "--silent", "--show-error", "--max-time", "25", url],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+                if result.returncode:
+                    raise OSError("source-bound HTTPS request failed")
+                return unescape(result.stdout[:3_000_000].decode("utf-8", errors="replace"))
             with urlopen(Request(url, headers={"User-Agent": "ArtelOperator-Editorial/1.0"}), timeout=25) as response:
                 if response.status != 200 or urlparse(response.url).netloc != urlparse(url).netloc or urlparse(response.url).scheme != "https":
                     raise ValueError("Неподтверждённая ссылка")
@@ -384,10 +423,16 @@ def _public_html(url):
     raise ValueError(f"Не удалось подтвердить публичную страницу после трёх попыток: {url}") from None
 
 
-def _public_json(url):
+def _public_json(url, network_interface=None):
     """Read public CMS/manifest JSON without HTML entity conversion."""
     for attempt in range(3):
         try:
+            if network_interface:
+                result = subprocess.run(["/usr/bin/curl", "--interface", network_interface, "--fail", "--silent", "--show-error", "--max-time", "25", url],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+                if result.returncode:
+                    raise OSError("source-bound HTTPS request failed")
+                return json.loads(result.stdout[:3_000_000].decode("utf-8"))
             with urlopen(Request(url, headers={"User-Agent": "ArtelOperator-Editorial/1.0"}), timeout=25) as response:
                 if response.status != 200 or urlparse(response.url).netloc != urlparse(url).netloc or urlparse(response.url).scheme != "https":
                     raise ValueError("Неподтверждённый адрес CMS")
@@ -432,7 +477,8 @@ def _verify_existing_publication(conf, edition):
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
         raise ValueError("Некорректный slug сохранённой статьи")
     query = urlencode({"filters[slug][$eq]": slug, "populate": "image", "status": "published"})
-    payload = _public_json("https://cms.rusplast-zavod.ru/api/articles?" + query)
+    cms_url = "https://cms.rusplast-zavod.ru/api/articles?" + query
+    payload = _public_json(cms_url, conf["network_interface"]) if conf.get("network_interface") else _public_json(cms_url)
     entries = payload.get("data", [])
     if len(entries) != 1 or not entries[0].get("image") or not entries[0].get("documentId"):
         raise ValueError("Сохранённая статья не найдена среди публикаций CMS; повтор не создаёт замену")
@@ -452,15 +498,18 @@ def _verify_existing_publication(conf, edition):
     if public_article != expected:
         raise ValueError("Статья изменена в CMS после выпуска; повтор сохраняет правки редактора и ничего не публикует")
     sha = hashlib.sha256(json.dumps(public_article, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    manifest = _public_json(conf["site_url"] + "/publication-manifest.json")
+    manifest_url = conf["site_url"] + "/publication-manifest.json"
+    manifest = _public_json(manifest_url, conf["network_interface"]) if conf.get("network_interface") else _public_json(manifest_url)
     if manifest.get("articles", {}).get(slug, {}).get("sha256") != sha:
         raise ValueError("Публичный manifest не подтверждает текущую статью CMS; повтор ничего не меняет")
     url = conf["site_url"] + "/blog/" + slug
     page = _PublishedArticlePage()
-    page.feed(_public_html(url))
+    page.feed(_public_html(url, conf["network_interface"]) if conf.get("network_interface") else _public_html(url))
     if "".join(page.heading) != original["title"] or media_url not in page.images:
         raise ValueError("Публичная страница не подтвердила заголовок и обложку CMS")
-    if url not in _public_html(conf["site_url"] + "/sitemap.xml"):
+    sitemap_url = conf["site_url"] + "/sitemap.xml"
+    sitemap = _public_html(sitemap_url, conf["network_interface"]) if conf.get("network_interface") else _public_html(sitemap_url)
+    if url not in sitemap:
         raise ValueError("Опубликованная статья отсутствует в sitemap")
     return {"article": public_article, "url": url, "slug": slug, "sha256": sha,
             "release": manifest.get("release") or "verified-live", "documentId": entry["documentId"], "imageId": media["id"],
@@ -529,7 +578,9 @@ def prepare_article(conf, record, directory, progress):
             raise ValueError("Сохранённая обложка изменена; публикация остановлена")
         _json(directory / "article.json", draft["article"])
         site = Path(conf["site_root"])
-        validation = _run_json([conf["python_path"], str(site / "scripts/publish-article.py"), "--article", str((directory / "article.json").resolve()), "--image", str(cover), "--validate-only"], site, 120, "Проверка публикации CMS")
+        environment = {"RUSPLAST_NETWORK_INTERFACE": conf["network_interface"]} if conf.get("network_interface") else None
+        kwargs = {"extra_env": environment} if environment else {}
+        validation = _run_json([conf["python_path"], str(site / "scripts/publish-article.py"), "--article", str((directory / "article.json").resolve()), "--image", str(cover), "--validate-only"], site, 120, "Проверка публикации CMS", **kwargs)
         if validation.get("valid") is not True or validation.get("slug") != draft["article"]["slug"]:
             raise ValueError("Сайт не подтвердил структуру статьи и обложку")
         existing["status"] = "prepared"
@@ -565,7 +616,9 @@ def publish_article(conf, record, sources, root, progress):
         raise ValueError("У выпуска нет проверенной уникальной обложки")
     progress({"stage": "seo-publish", "message": "Загружаем обложку в Media Library и публикуем статью в CMS"})
     site = Path(conf["site_root"])
-    published = _run_json([conf["python_path"], str(site / "scripts/publish-article.py"), "--article", str(article_path), "--image", image["path"]], site, 900, "Публикация CMS")
+    environment = {"RUSPLAST_NETWORK_INTERFACE": conf["network_interface"]} if conf.get("network_interface") else None
+    kwargs = {"extra_env": environment} if environment else {}
+    published = _run_json([conf["python_path"], str(site / "scripts/publish-article.py"), "--article", str(article_path), "--image", image["path"]], site, 900, "Публикация CMS", **kwargs)
     expected_url = conf["site_url"] + "/blog/" + article["slug"]
     expected_input_sha = hashlib.sha256(json.dumps({"article": article, "imageSha256": image["sha256"]}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     public_article = published.get("article") or {}
@@ -577,7 +630,7 @@ def publish_article(conf, record, sources, root, progress):
             or not published.get("documentId") or not published.get("imageId") or not published.get("release")):
         raise ValueError("Publisher не подтвердил URL, статью, хеш и выпуск сайта")
     try:
-        body = _public_html(expected_url)
+        body = _public_html(expected_url, conf["network_interface"]) if conf.get("network_interface") else _public_html(expected_url)
         if article["title"] not in body or article["description"] not in body or public_article["image"] not in body:
             raise ValueError("Несовпадение HTML")
     except Exception:

@@ -3,6 +3,7 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import json
+import subprocess
 
 import pytest
 
@@ -19,6 +20,66 @@ def isolated(tmp_path, monkeypatch):
         monkeypatch.setattr(module, "DATA", tmp_path / "data")
     storage.init()
     return tmp_path
+
+
+@pytest.mark.parametrize("old_layout", [True, False])
+def test_codex_resolves_updated_layout_in_same_app(tmp_path, old_layout):
+    root = tmp_path / "ChatGPT.app/Contents/Resources"
+    legacy = root / "codex"
+    nested = root / "codex-cli/CodexCLI.app/Contents/MacOS/codex"
+    configured, installed = (legacy, nested) if old_layout else (nested, legacy)
+    installed.parent.mkdir(parents=True)
+    installed.write_text("#!/bin/sh\nexit 0\n")
+    installed.chmod(0o700)
+    assert seo._codex_executable(str(configured)) == str(installed)
+    configured.parent.mkdir(parents=True, exist_ok=True)
+    configured.write_text("#!/bin/sh\nexit 0\n")
+    configured.chmod(0o700)
+    assert seo._codex_executable(str(configured)) == str(configured)
+
+
+def test_codex_missing_or_nonexecutable_has_actionable_error(tmp_path):
+    configured = tmp_path / "custom-codex"
+    for exists in (False, True):
+        if exists:
+            configured.write_text("not executable")
+            configured.chmod(0o600)
+        with pytest.raises(ValueError, match="codex_path"):
+            seo._codex_executable(str(configured))
+
+
+@pytest.mark.parametrize("outcome", ["success", "timeout", "oserror", "failed", "missing", "invalid"])
+def test_generation_diagnostics_and_result(isolated, monkeypatch, outcome):
+    directory = isolated / "run"
+    directory.mkdir()
+    # An earlier result must never turn a failed invocation into success.
+    (directory / "draft.json").write_text('{"stale": true}')
+    monkeypatch.setattr(seo, "_codex_executable", lambda path: "/resolved/codex")
+    def run(command, **kwargs):
+        assert command[0] == "/resolved/codex"
+        assert command[command.index("--sandbox") + 1] == "read-only"
+        assert "--ignore-user-config" in command
+        kwargs["stderr"].write("private provider diagnostic")
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if outcome == "oserror":
+            raise OSError("private operating system diagnostic")
+        if outcome not in ("missing", "failed"):
+            Path(command[command.index("-o") + 1]).write_text('{"ok": true}' if outcome == "success" else 'bad JSON')
+        return subprocess.CompletedProcess(command, 1 if outcome == "failed" else 0)
+    monkeypatch.setattr(seo.subprocess, "run", run)
+    if outcome == "success":
+        assert seo._generate(conf(), directory, "test", seo.obj({"ok": {"type": "boolean"}}), "draft") == {"ok": True}
+    else:
+        with pytest.raises(ValueError) as error:
+            seo._generate(conf(), directory, "test", {}, "draft")
+        assert "private" not in str(error.value)
+        expected = {"timeout": "превышено время", "oserror": "codex_path", "failed": "Диагностика", "missing": "Диагностика", "invalid": "некорректный JSON"}
+        assert expected[outcome] in str(error.value)
+    diagnostic = storage.DATA / "logs/seo-generation.log"
+    assert "private provider diagnostic" in diagnostic.read_text()
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+    assert not list(directory.glob("*.log"))
 
 
 def content():
@@ -119,7 +180,7 @@ def test_prepared_edition_is_reused_after_restart_without_generation(isolated, m
     review = {"approved": True, "sourceGrounded": True, "distinctIntent": True, "usefulForBuyer": True, "issues": []}
     seo._save("rusplast-seo", "2026-09-23", {"status": "prepared", "draft": draft, "context": context, "review": review, "image": {"path": str(isolated / "cover.png"), "sha256": "1" * 64}})
     monkeypatch.setattr(seo, "inspect_cover", lambda path: {"sha256": "1" * 64})
-    monkeypatch.setattr(seo, "_run_json", lambda *args: {"valid": True, "slug": draft["article"]["slug"]})
+    monkeypatch.setattr(seo, "_run_json", lambda *args, **kwargs: {"valid": True, "slug": draft["article"]["slug"]})
     monkeypatch.setattr(seo, "_generate", lambda *a: pytest.fail("A retry must not create another article"))
     directory = isolated / "retry"
     directory.mkdir()
@@ -135,7 +196,7 @@ def test_wrong_publication_receipt_cannot_mark_success(isolated, monkeypatch):
     path = isolated / "article.json"
     path.write_text(json.dumps(draft["article"]))
     monkeypatch.setattr(seo, "_verify_links", lambda *args: [])
-    monkeypatch.setattr(seo, "_run_json", lambda *args: {"url": "https://rusplast-zavod.ru/blog/" + draft["article"]["slug"], "slug": draft["article"]["slug"], "sha256": "0" * 64, "release": "fake"})
+    monkeypatch.setattr(seo, "_run_json", lambda *args, **kwargs: {"url": "https://rusplast-zavod.ru/blog/" + draft["article"]["slug"], "slug": draft["article"]["slug"], "sha256": "0" * 64, "release": "fake"})
     with pytest.raises(ValueError, match="Publisher не подтвердил"):
         seo.publish_article(conf(), {"run_date": "2026-09-23"}, [{"path": str(path)}], isolated, lambda event: None)
     assert seo._get("rusplast-seo", "2026-09-23")["status"] == "prepared"
@@ -183,7 +244,7 @@ def test_cover_rejects_missing_or_unrelated_file(isolated, monkeypatch):
 
 
 def test_context_refuses_legacy_static_editorial_data(isolated, monkeypatch):
-    monkeypatch.setattr(seo, "_run_json", lambda *args: {"articles": [], "products": [], "approvedImages": ["pipe-gray"]})
+    monkeypatch.setattr(seo, "_run_json", lambda *args, **kwargs: {"articles": [], "products": [], "approvedImages": ["pipe-gray"]})
     with pytest.raises(ValueError, match="Strapi CMS"):
         seo.collect_context(conf())
 
@@ -219,8 +280,8 @@ def existing_publication_fixture(monkeypatch):
     public = {'entry': entry, 'manifest': manifest,
               'html': '<h1>' + escape(original['title']) + '</h1><img src="' + normalized['image'] + '">',
               'sitemap': '<loc>https://rusplast-zavod.ru/blog/' + original['slug'] + '</loc>'}
-    monkeypatch.setattr(seo, '_public_json', lambda url: {'data': [public['entry']]} if '/api/articles?' in url else public['manifest'])
-    monkeypatch.setattr(seo, '_public_html', lambda url: public['sitemap'] if url.endswith('/sitemap.xml') else public['html'])
+    monkeypatch.setattr(seo, '_public_json', lambda url, *args: {'data': [public['entry']]} if '/api/articles?' in url else public['manifest'])
+    monkeypatch.setattr(seo, '_public_html', lambda url, *args: public['sitemap'] if url.endswith('/sitemap.xml') else public['html'])
     monkeypatch.setattr(seo, '_generate', lambda *a, **k: pytest.fail('Published retry must not generate'))
     monkeypatch.setattr(seo, '_run_json', lambda *a, **k: pytest.fail('Published retry must not execute publisher'))
     return edition, public, normalized
@@ -267,7 +328,7 @@ def test_published_retry_requires_matching_manifest_and_actual_img_tag(isolated,
 
 def test_missing_published_cms_entry_never_triggers_generation(isolated, monkeypatch):
     edition, _, _ = existing_publication_fixture(monkeypatch)
-    monkeypatch.setattr(seo, '_public_json', lambda url: {'data': []})
+    monkeypatch.setattr(seo, '_public_json', lambda url, *args: {'data': []})
     with pytest.raises(ValueError, match='не найдена'):
         seo._verify_existing_publication(conf(), edition)
 
@@ -338,7 +399,7 @@ def test_manual_edition_retry_uses_own_text_and_cover(isolated, monkeypatch):
     seo._save(c['id'], '2026-09-23', planned)
     seo._save(c['id'], 'manual:replacement', {'status': 'prepared', 'draft': draft, 'context': context, 'review': review, 'image': image, 'off_schedule': True})
     monkeypatch.setattr(seo, 'inspect_cover', lambda path: {'sha256': '1' * 64})
-    monkeypatch.setattr(seo, '_run_json', lambda *args: {'valid': True, 'slug': draft['article']['slug']})
+    monkeypatch.setattr(seo, '_run_json', lambda *args, **kwargs: {'valid': True, 'slug': draft['article']['slug']})
     monkeypatch.setattr(seo, '_generate', lambda *args, **kwargs: pytest.fail('Retry must reuse text and cover'))
     directory = isolated / 'retry'; directory.mkdir()
     record = {'run_date': '2026-09-23', 'edition_slot': 'manual:replacement', 'off_schedule': True}

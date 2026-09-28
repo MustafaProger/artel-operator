@@ -10,9 +10,10 @@ schedule:
   timezone: Europe/Moscow
 site_url: https://rusplast-zavod.ru
 site_root: /Users/mustafa/Desktop/rusplast-zavod
-codex_path: /Applications/ChatGPT.app/Contents/Resources/codex
+codex_path: /Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex
 node_path: /usr/local/bin/node
 python_path: /usr/bin/python3
+network_interface: en0
 generation_timeout: 720
 image_generation_timeout: 900
 ---
