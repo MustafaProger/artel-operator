@@ -1,8 +1,25 @@
-.venv/
-data/
-work/
+# Local runtime and scratch files
+/.venv/
+/data/
+/work/
+
+# Python and test caches
 __pycache__/
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+/build/
+/dist/
+
+# Local configuration, logs, and macOS metadata
 .env
+.env.*
+!.env.example
 .DS_Store
+._*
 *.log

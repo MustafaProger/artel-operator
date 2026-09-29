@@ -1,8 +1,14 @@
-.venv
-data
-.git
-.pytest_cache
-__pycache__
-tests
-*.log
-.env
+# The image only needs dependencies, application code, and operator definitions.
+**
+!Dockerfile
+!requirements.txt
+!operator_app/
+!operator_app/**
+!operators/
+!operators/*.md
+**/__pycache__/
+**/*.py[cod]
+**/.DS_Store
+**/._*
+**/*.log
+**/.env*
