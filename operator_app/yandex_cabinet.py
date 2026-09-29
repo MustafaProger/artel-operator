@@ -11,7 +11,7 @@ import json
 import re
 import uuid
 
-from .yandex_reports import number, phone_hash, text, display_name
+from .yandex_reports import CANCELLED_ORDER_STATUSES, number, phone_hash, text, display_name
 
 API = "https://b2b-api-lk.go.yandex.ru"
 ORDERS = "/corp-cabinet/2.0/orders/tanker/list"
@@ -87,10 +87,16 @@ def normalize_order(order, company_id, start, end):
         litres, amount = number(order["liters_filled"]), number(order["final_price"])
         if order.get("currency") != "RUB":
             raise ValueError()
-        if (order["status"] not in {"Completed", "Cancelled"}
-                or order["status"] == "Cancelled" and (litres != 0 or amount != 0)
-                or litres < 0 or amount < 0 or litres == 0 and amount != 0):
-            raise CabinetError("Неизвестный статус, возврат или несогласованные суммы Яндекса: нужна проверка")
+        status = order["status"]
+        if status not in CANCELLED_ORDER_STATUSES | {"Completed"}:
+            # An actionable order ID is safe for the audit; names/phones and
+            # arbitrary untrusted status values must not enter error messages.
+            label = status if isinstance(status, str) and re.fullmatch(r"[A-Za-z]{1,40}", status) else "неизвестный"
+            raise CabinetError(f"Заказ Яндекса {order['id']}: неподдержанный статус «{label}», нужна проверка")
+        if status in CANCELLED_ORDER_STATUSES and (litres != 0 or amount != 0):
+            raise CabinetError(f"Отменённый заказ Яндекса {order['id']} содержит ненулевые литры или стоимость: нужна проверка")
+        if litres < 0 or amount < 0 or litres == 0 and amount != 0:
+            raise CabinetError(f"Заказ Яндекса {order['id']}: возврат или несогласованные суммы, нужна проверка")
         return {"id": order["id"], "user_id": order["user_id"], "source_name": name,
                 "phone_sha256": phone_hash(phone), "date": timestamp.date().isoformat(),
                 "created_at": timestamp.isoformat(), "status": order["status"],

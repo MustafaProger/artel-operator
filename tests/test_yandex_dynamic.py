@@ -142,12 +142,110 @@ def test_excel_must_match_each_cabinet_order(tmp_path,cell,value):
     with pytest.raises(ValueError):read_report(p,START,END,'ООО НК АРТЭЛЬ',expected_orders=manifest([raw])['orders'])
 
 
-def test_skip_cancelled_only_employee_before_any_report_request(tmp_path):
-    raw=order(status='Cancelled',liters_filled='0',final_price='0')
+@pytest.mark.parametrize('status', ['Cancelled', 'StationCanceled', 'UserCanceled'])
+def test_skip_cancelled_only_employee_before_any_report_request(tmp_path, status):
+    raw=order(status=status,liters_filled='0',final_price='0')
     employee=discover_employees(manifest([raw]))[0];api=Mock();browser=Mock();events=[]
+    assert employee['orders'][0]['status'] == status
     assert download_employee(api,browser,tmp_path,employee,START,END,'ООО НК АРТЭЛЬ',[],events.append) is None
     assert not api.mock_calls and not browser.mock_calls and not list(tmp_path.iterdir())
     assert events[0]['reason']=='no_operations'
+
+
+@pytest.mark.parametrize('status', ['Cancelled', 'StationCanceled', 'UserCanceled'])
+@pytest.mark.parametrize('litres,amount', [('0', '1'), ('1', '0'), ('1', '1')])
+def test_cancellation_requires_both_zero_litres_and_zero_cost(status, litres, amount):
+    with pytest.raises(CabinetError, match='Отменённый заказ.*ненулевые'):
+        manifest([order(status=status, liters_filled=litres, final_price=amount)])
+
+
+@pytest.mark.parametrize('status', ['Cancelled', 'StationCanceled', 'UserCanceled'])
+def test_full_excel_reconciles_zero_cancellation_without_losing_its_order_id(tmp_path, status):
+    completed = order()
+    cancelled = order(2, status=status, liters_filled='0', final_price='0')
+    expected = manifest([completed, cancelled])['orders']
+    path = workbook(tmp_path/'with-cancellation.xlsx', completed)
+    book = load_workbook(path)
+    sheet = book.active
+    sheet.insert_rows(9)
+    sheet['D4'] = 2
+    for column, value in enumerate([
+        '15.09.2026', cancelled['user_info']['fullname'], cancelled['user_info']['phone'],
+        cancelled['id'], 'АИ-100', 35.74, 0, 'Отменён', 0, 0,
+    ], 1):
+        sheet.cell(9, column, value)
+    book.save(path)
+    book.close()
+    report = read_report(path, START, END, 'ООО НК АРТЭЛЬ', expected_orders=expected)
+    assert report['order_count'] == 2
+    assert {o['id'] for o in report['orders']} == {completed['id'], cancelled['id']}
+    assert len(report['operations']) == 1
+    assert report['litres'] == '30' and report['amount'] == '3141.9'
+    # The same zero row cannot masquerade as a completed cabinet order.
+    mismatched = deepcopy(expected)
+    mismatched[1]['status'] = 'Completed'
+    with pytest.raises(ValueError, match='Статус Excel'):
+        read_report(path, START, END, 'ООО НК АРТЭЛЬ', expected_orders=mismatched)
+
+
+@pytest.mark.parametrize('status', ['StationCanceled', 'UserCanceled'])
+def test_xlsx_omits_verified_zero_cancellation_but_audit_retains_it(tmp_path, status):
+    completed = order()
+    cancelled = order(2, status=status, liters_filled='0', final_price='0')
+    expected = manifest([completed, cancelled])['orders']
+    path = workbook(tmp_path/'completed-only.xlsx', completed)
+    report = read_report(path, START, END, 'ООО НК АРТЭЛЬ', expected_orders=expected)
+    assert report['order_count'] == 1 and report['cabinet_order_count'] == 2
+    assert report['cabinet_only_zero_cancellations'] == [dict(
+        id=cancelled['id'], status=status, date='2026-09-15', litres='0', amount='0')]
+    assert report['litres'] == '30' and report['amount'] == '3141.9'
+
+
+@pytest.mark.parametrize('changes', [
+    dict(status='Completed', litres='0', amount='0'),
+    dict(status='Completed', litres='30', amount='3141.90'),
+    dict(status='Refunded', litres='0', amount='0'),
+    dict(status='Unknown', litres='0', amount='0'),
+    dict(status='Cancelled', litres='0', amount='0'),
+    dict(status='StationCanceled', litres='1', amount='0'),
+    dict(status='UserCanceled', litres='0', amount='1'),
+    dict(status='StationCanceled', litres='0', amount='0', user_id='b'*32),
+])
+def test_xlsx_missing_any_unconfirmed_or_nonzero_order_still_blocks(tmp_path, changes):
+    completed = order()
+    expected = manifest([completed, order(2)])['orders']
+    expected[1].update(changes)
+    path = workbook(tmp_path/'missing.xlsx', completed)
+    with pytest.raises(ValueError, match='отсутствуют обязательные заказы'):
+        read_report(path, START, END, 'ООО НК АРТЭЛЬ', expected_orders=expected)
+
+
+def test_rejected_download_preserves_original_without_publishing(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    from operator_app import yandex
+    employee = discover_employees(manifest([order()]))[0]
+    identity = 'f'*32
+    columns = ['due_data', 'user_fullname', 'user_phone', 'order_id',
+               'fuel_type', 'fuel_filled', 'status', 'price']
+    cabinet = Mock()
+    cabinet.request.side_effect = [
+        dict(reports=[]), dict(tanker=[dict(tab='report.report', columns=[dict(id=c) for c in columns])]),
+        dict(task_id=identity), dict(task_id=identity, status='complete'),
+    ]
+    page = MagicMock()
+    page.expect_download.return_value.__enter__.return_value.value.save_as.side_effect = source
+    monkeypatch.setattr(yandex, 'verify_page', Mock())
+    monkeypatch.setattr(yandex, 'open_reports', Mock())
+    monkeypatch.setattr(yandex, 'read_report', Mock(side_effect=ValueError('Состав Excel не совпал')))
+    events = []
+    with pytest.raises(ValueError, match='Состав Excel'):
+        download_employee(cabinet, page, tmp_path, employee, START, END, 'ООО НК АРТЭЛЬ', [], events.append)
+    rejected = tmp_path/'На проверку'/f'{identity}.xlsx'
+    assert rejected.is_file() and rejected.stat().st_mode & 0o777 == 0o600
+    assert not list(tmp_path.glob('Яндекс.*.xlsx'))
+    assert not (tmp_path/f".{employee['user_id']}.xlsx").exists()
+    assert events[-1]['stage'] == 'validation_failed'
+    assert events[-1]['source_path'] == str(rejected)
 
 
 def test_dynamic_full_engine_and_missing_third_blocks_publication(isolated_engine,tmp_path,monkeypatch):

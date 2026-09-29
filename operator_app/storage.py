@@ -39,12 +39,15 @@ def db():
         conn.close()
 
 
-def create_run(operator_id, run_date, start, end, trigger, *, require_idle=False, edition_key=None):
+def create_run(operator_id, run_date, start, end, trigger, *, require_idle=False, edition_key=None, plan=None, scope=None):
     record = dict(id=uuid.uuid4().hex, operator_id=operator_id, run_date=str(run_date), trigger=trigger,
                   period_start=str(start), period_end=str(end), status="queued", created_at=now_iso(),
                   finished_at=None, error=None, files=[], report="", events=[])
     if edition_key is not None:
         record.update(edition_key=edition_key, edition_slot="manual:" + edition_key, off_schedule=True)
+    if plan is not None:
+        record["plan"] = plan
+        record["scope"] = scope
     with db() as conn:
         if require_idle:
             # Reserve before reading: two connections cannot both observe an idle
@@ -64,6 +67,14 @@ def save_run(record):
 def runs(limit=100):
     with db() as conn:
         return [json.loads(r[0]) for r in conn.execute("SELECT payload FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+
+def operator_runs(operator_id, first, last):
+    """Calendar history lookup, independent of the dashboard's 100-row limit."""
+    with db() as conn:
+        return [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM runs WHERE operator_id=? AND run_date BETWEEN ? AND ? ORDER BY created_at DESC, rowid DESC",
+            (operator_id, str(first), str(last)))]
 
 
 def get_run(ident):

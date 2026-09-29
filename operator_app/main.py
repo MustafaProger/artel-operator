@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 import asyncio
 import os
 import re
@@ -16,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from . import engine, storage
 from . import yandex_connection
-from .config import DATA, OPERATORS, ROOT, get_operator, load_operators, next_run, parse_operator
+from .config import DATA, OPERATORS, ROOT, get_operator, load_operators, latest_run_date, next_run, parse_operator, run_plan
 
 
 async def scheduler():
@@ -90,16 +92,42 @@ class ConnectionBody(BaseModel):
     password: str = Field(min_length=1, max_length=500)
 
 
+def operator_plan(conf: dict, day: date, now: datetime | None = None) -> dict:
+    """Read-only preview uses the same period snapshot as a submitted run."""
+    current = now or datetime.now(timezone.utc)
+    today = current.astimezone(ZoneInfo(conf["schedule"]["timezone"])).date()
+    plan = engine.plan_run(conf, day) if conf["kind"] == "glopro" else run_plan(conf, day)
+    return {**plan, "future": day > today, "can_run": day <= today}
+
+
+def state_plan(conf: dict, day: date, now: datetime) -> dict:
+    try:
+        return operator_plan(conf, day, now)
+    except ValueError as exc:
+        # A history conflict must remain visible without breaking the entire UI.
+        return {"run_date": day.isoformat(), "error": str(exc), "can_run": False}
+
+
 @app.get("/api/state")
 def state():
     operators = []
+    now = datetime.now(timezone.utc)
     for conf in load_operators():
-        planned = next_run(conf)
+        planned = engine.next_scheduled_run(conf, now) if conf["kind"] == "glopro" else next_run(conf, now)
         if conf["kind"] == "seo":
             from .seo import next_due
             due = next_due(conf)
             planned = due.isoformat() if due else None
-        operators.append({k: v for k, v in {**conf, "next_run": planned}.items() if k != "markdown"})
+        next_plan = latest_plan = None
+        if conf["kind"] in {"glopro", "yandex", "seo"}:
+            if planned:
+                next_plan = state_plan(conf, datetime.fromisoformat(planned).date(), now)
+            try:
+                latest_plan = state_plan(conf, latest_run_date(now, conf), now)
+            except ValueError:
+                pass  # A future SEO anchor does not yet have a completed slot.
+        operators.append({k: v for k, v in {**conf, "next_run": planned,
+                          "next_plan": next_plan, "latest_plan": latest_plan}.items() if k != "markdown"})
     return {"operators": operators, "runs": storage.runs(), "server_time": storage.now_iso(),
             "yandex": yandex_connection.status(),
             "connection": {"configured": bool(storage.credentials()), "verified": storage.setting("connection_verified", False)},
@@ -116,6 +144,11 @@ def read_operator(ident: str):
     return {"markdown": get_operator(ident)["markdown"]}
 
 
+@app.get("/api/operators/{ident}/plan")
+def preview_plan(ident: str, run_date: str):
+    return operator_plan(get_operator(ident), date.fromisoformat(run_date))
+
+
 def write_operator(ident, markdown):
     conf = parse_operator(markdown, ident)
     existing = OPERATORS / f"{ident}.md"
@@ -127,7 +160,9 @@ def write_operator(ident, markdown):
         storage.set_setting(f"enabled_since:{ident}", storage.now_iso())
     if not conf["enabled"]:
         storage.set_setting(f"enabled_since:{ident}", None)
-    return {"ok": True, "next_run": next_run(conf)}
+    now = datetime.now(timezone.utc)
+    planned = engine.next_scheduled_run(conf, now) if conf["kind"] == "glopro" else next_run(conf, now)
+    return {"ok": True, "next_run": planned}
 
 
 @app.put("/api/operators/{ident}")

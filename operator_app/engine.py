@@ -5,21 +5,24 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from threading import Lock
+from typing import Callable
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 import hashlib
+from copy import deepcopy
 import json
 import re
 import shutil
 import sqlite3
+import stat
 import zipfile
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from . import storage
-from .calculator import calculate_workbook, company_identity, merge_reports, render_report, workbook_client
+from .calculator import calculate_workbook, company_identity, merge_reports, render_report, workbook_client, weekly_kind
 from .clients import client_is_excluded
-from .config import DATA, DAYS, get_operator, load_operators, latest_run_date, period_for, client_period_for, schedule_matches, seo_slot
+from .config import DATA, get_operator, load_operators, latest_run_date, period_for, schedule_matches, seo_slot, run_plan, next_run, plan_for_clients
 from .publication import save_report_sections
 from .ordering import alphabet_key
 
@@ -38,6 +41,9 @@ class ProcessResult:
     error: str | None = None
     metrics: dict = field(default_factory=dict)
     audit: dict = field(default_factory=dict)
+    # Built-in note writers run only after local artifacts have been checked.
+    # This callback is never serialized or retried by the executor.
+    publish: Callable[[], None] | None = field(default=None, repr=False)
 
 
 def glopro_download(conf, record, directory, progress):
@@ -52,7 +58,7 @@ def glopro_download(conf, record, directory, progress):
     return GloProConnector(*creds).download_reports(
         record["period_start"], record["period_end"], directory,
         clients=conf.get("clients", []), progress=connected_progress,
-        excluded_clients=conf.get("excluded_clients", []), run_date=record["run_date"])
+        excluded_clients=conf.get("excluded_clients", []), run_date=record["run_date"], plan=record.get("plan"))
 
 
 HANDLERS["glopro"] = glopro_download
@@ -74,6 +80,87 @@ def seo_download(conf, record, directory, progress):
 HANDLERS["seo"] = seo_download
 
 
+def _run_scope(conf):
+    return {"clients": conf.get("clients", []), "excluded_clients": conf.get("excluded_clients", [])}
+
+
+def _legacy_plan(conf, day, record):
+    # Old runs can have a wide top-level period for a special-client-only
+    # recovery. It is not the ordinary firms' accounting boundary.
+    legacy = {**conf, "schedule": {k: v for k, v in conf["schedule"].items()
+                                  if k not in {"month_boundary", "month_boundary_from"}}}
+    legacy["schedule"]["days"] = ["tue", "fri"]
+    plan = run_plan(legacy, day)
+    ordinary = {tuple(item["period"]) for item in record.get("company_periods", [])
+                if not weekly_kind(item["client"]) and len(item.get("period", [])) == 2}
+    if len(ordinary) == 1:
+        plan["ordinary_period"] = list(ordinary.pop())
+        plan["period_start"], plan["period_end"] = plan["ordinary_period"]
+        plan["calendar_periods"]["ordinary"] = list(plan["ordinary_period"])
+    plan["from_history"] = True
+    return plan
+
+
+def plan_run(conf, day):
+    """One stable plan for preview, enqueue and retries; history is read-only."""
+    if conf["kind"] != "glopro":
+        return run_plan(conf, day)
+    history = storage.operator_runs(conf["id"], day - timedelta(days=10), day + timedelta(days=10))
+    same_day = [item for item in history if item["run_date"] == day.isoformat()]
+    saved = next((item for item in same_day if item.get("plan")), None)
+    if saved:
+        if saved.get("scope") != _run_scope(conf):
+            return plan_for_clients(saved["plan"], conf)
+        return deepcopy(saved["plan"])
+    if same_day:
+        return _legacy_plan(conf, day, same_day[0])
+    plan = run_plan(conf, day)
+    ordinary = plan.get("ordinary_period")
+    if ordinary and conf["schedule"].get("month_boundary"):
+        for previous in history:
+            old_plan = previous.get("plan") or _legacy_plan(conf, date.fromisoformat(previous["run_date"]), previous)
+            old = old_plan.get("ordinary_period")
+            if old and ordinary[0] <= old[1] and old[0] <= ordinary[1]:
+                raise ValueError(f"Период {ordinary[0]} — {ordinary[1]} пересекается с сохранённым запуском "
+                                 f"{previous['run_date']} ({old[0]} — {old[1]}). Повторите сохранённую дату; "
+                                 "изменение календаря требует сверки уже обработанных периодов.")
+    return plan
+
+
+def _schedule_satisfied(conf, day):
+    # Imports or old/manual subset recoveries do not prove full coverage.
+    # Only a successful download with the same captured client scope can
+    # replace the automatic attempt for this exact logical date.
+    return any(item["trigger"] == "manual" and item["status"] in {"completed", "no_data"}
+               and item.get("plan") and item.get("scope") == _run_scope(conf)
+               for item in storage.operator_runs(conf["id"], day, day))
+
+
+def next_scheduled_run(conf, now=None):
+    """Upcoming calendar slot that the scheduler will still attempt."""
+    candidate = next_run(conf, now)
+    while candidate and conf["kind"] == "glopro":
+        when = datetime.fromisoformat(candidate)
+        attempted = any(item["trigger"] == "schedule"
+                        for item in storage.operator_runs(conf["id"], when.date(), when.date()))
+        if not attempted and not _schedule_satisfied(conf, when.date()):
+            return candidate
+        candidate = next_run(conf, when)
+    return candidate
+
+
+def _client_record_period(record, client, client_id=None):
+    plan = record.get("plan")
+    if plan:
+        period = plan["weekly_period" if weekly_kind(client, client_id) else "ordinary_period"]
+        return tuple(date.fromisoformat(value) for value in period) if period else None
+    # Compatibility for direct processor integrations with old run records.
+    if weekly_kind(client, client_id):
+        day = date.fromisoformat(record["run_date"])
+        return (day - timedelta(days=7), day - timedelta(days=1)) if day.weekday() == 1 else None
+    return date.fromisoformat(record["period_start"]), date.fromisoformat(record["period_end"])
+
+
 def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edition_key=None):
     conf = get_operator(ident)
     if edition_key is not None and (conf["kind"] != "seo" or trigger != "manual" or run_date is not None
@@ -81,7 +168,7 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edi
         raise ValueError("Внеплановый выпуск: нужен SEO-оператор и постоянный edition_key без run_date")
     if conf["kind"] not in HANDLERS or conf["kind"] not in PROCESSORS:
         raise ValueError("Для этого оператора ещё не подключены получение и обработка результатов")
-    scheduled_date = date.fromisoformat(run_date) if run_date else latest_run_date()
+    scheduled_date = date.fromisoformat(run_date) if run_date else latest_run_date(conf=conf)
     if conf["kind"] == "seo":
         if uploads is not None:
             raise ValueError("SEO: импорт XLSX не поддерживается")
@@ -98,7 +185,11 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edi
             scheduled_date -= timedelta(days=1)
     if scheduled_date > datetime.now(ZoneInfo(conf["schedule"]["timezone"])).date():
         raise ValueError("Нельзя рассчитывать ещё не завершившийся период")
-    if conf["kind"] == "yandex":
+    plan = None
+    if conf["kind"] == "glopro":
+        plan = plan_run(conf, scheduled_date)
+        start, end = date.fromisoformat(plan["period_start"]), date.fromisoformat(plan["period_end"])
+    elif conf["kind"] == "yandex":
         from .yandex_reports import period_for as yandex_period
         start, end = yandex_period(scheduled_date)
     elif conf["kind"] == "seo":
@@ -107,7 +198,8 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edi
         start, end = period_for(scheduled_date)
     with SUBMIT_LOCK:
         record = storage.create_run(ident, scheduled_date, start, end, trigger,
-                                    require_idle=True, edition_key=edition_key)
+                                    require_idle=True, edition_key=edition_key,
+                                    plan=plan, scope=deepcopy(_run_scope(conf)) if plan else None)
         # Snapshot now: edits made during a queued/running job apply next time.
         try:
             POOL.submit(execute, conf, record, uploads)
@@ -124,6 +216,31 @@ def _file(record, path, root):
     rel = path.relative_to(root).as_posix()
     return dict(name=rel, url=f"/api/runs/{record['id']}/files/{quote(rel)}", size=path.stat().st_size,
                 sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+def _artifact_files(root):
+    """List artifact files without silently skipping unreadable directories.
+
+    Path.rglob suppresses some traversal errors, which could turn an incomplete
+    archive/inventory into a successful run. Explicit listing/stat propagates
+    those errors. Keep the existing inclusion of file symlinks, without walking
+    directory symlinks or including dangling links.
+    """
+    pending = [root]
+    while pending:
+        for path in pending.pop().iterdir():
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                pending.append(path)
+            elif stat.S_ISREG(mode):
+                yield path
+            elif stat.S_ISLNK(mode):
+                try:
+                    target_mode = path.stat().st_mode
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(target_mode):
+                    yield path
 
 
 def _summary_xlsx(reports, target):
@@ -162,6 +279,11 @@ def _summary_xlsx(reports, target):
     book.save(target)
 
 
+def _publish_note(destination, report, writer):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    writer(destination, report)
+
+
 def process_glopro(conf, record, sources, root, progress, *, imported=False):
     """Calculate GloPro sources and write its domain-specific result files."""
     result = ProcessResult(status="failed")
@@ -172,7 +294,8 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
     def remember_schedule_skip(client):
         name = client.get("client") or client.get("name") or ""
         ident = str(client.get("client_id") or client.get("id") or "")
-        schedule_skipped[ident or company_identity(name)] = {"client": name, "client_id": ident, "reason": "tuesday_only"}
+        schedule_skipped[ident or company_identity(name)] = {"client": name, "client_id": ident,
+                                                            "reason": client.get("reason", "tuesday_only")}
 
     def remember_exclusion(client):
         name = client.get("client") or client.get("name") or ""
@@ -183,7 +306,7 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
     for event in record.get("events", []):
         if event.get("stage") == "skipped" and event.get("reason") == "excluded_client":
             remember_exclusion(event)
-        elif event.get("stage") == "skipped" and event.get("reason") == "tuesday_only":
+        elif event.get("stage") == "skipped" and event.get("reason") in {"tuesday_only", "ordinary_run_moved"}:
             remember_schedule_skip(event)
     for source in sources:
         if client_is_excluded(source, conf.get("excluded_clients", [])):
@@ -193,12 +316,13 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
             continue
         try:
             client = source.get("client") or workbook_client(source["path"])
-            period = client_period_for(date.fromisoformat(record["run_date"]), client, source.get("client_id"))
+            period = _client_record_period(record, client, source.get("client_id"))
             if period is None:
-                skipped = {**source, "client": client}
+                reason = "tuesday_only" if weekly_kind(client, source.get("client_id")) else "ordinary_run_moved"
+                skipped = {**source, "client": client, "reason": reason}
                 remember_schedule_skip(skipped)
-                progress(dict(stage="skipped", reason="tuesday_only", client=client,
-                              client_id=source.get("client_id", ""), message=f"Только вторничный запуск: {client}"))
+                progress(dict(stage="skipped", reason=reason, client=client,
+                              client_id=source.get("client_id", ""), message=f"В этот запуск по календарю не входит: {client}"))
                 continue
             rules = {**conf.get("rules", {}), "supplier": conf.get("supplier", "Новое имя"),
                      "date_from": period[0], "date_to": period[1], "run_date": record["run_date"],
@@ -275,9 +399,8 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
         export_dir = conf.get("obsidian_output")
         if export_dir:
             directory = Path(export_dir).expanduser()
-            directory.mkdir(parents=True, exist_ok=True)
             destination = directory / f"Активация — {label}.md"
-            save_report_sections(destination, report_text)
+            result.publish = lambda: _publish_note(destination, report_text, save_report_sections)
     result.audit = {"reports": reports, "calculated_sources": calculated_sources, "errors": failures,
                     "empty_clients": result.metrics["empty_clients"],
                     "excluded_clients": list(excluded.values()), "schedule_skipped_clients": list(schedule_skipped.values()),
@@ -353,18 +476,18 @@ def process_yandex(conf, record, sources, root, progress, *, imported):
     if not any(r["active"] for r in reports):
         return ProcessResult("no_data", error="Подтверждено отсутствие заправок за неделю.", metrics=metrics, audit=audit)
     report_text = render_yandex_report(reports, date.fromisoformat(record["run_date"]))
+    publish = None
     if conf.get("obsidian_output"):
         destination = Path(conf["obsidian_output"]).expanduser()
-        destination.mkdir(parents=True, exist_ok=True)
         target = destination / f"Яндекс Заправки — {date.fromisoformat(record['run_date']):%d.%m.%Y}.md"
         try:
             merge_yandex_sections(target.read_text(encoding="utf-8") if target.exists() else "", report_text)
         except ValueError as exc:
             failures.append({"error": str(exc)})
             return ProcessResult("needs_review", error=str(exc), metrics=metrics, audit=audit)
-        save_yandex_sections(target, report_text)
+        publish = lambda: _publish_note(target, report_text, save_yandex_sections)
     write_outputs(reports, root, date.fromisoformat(record["run_date"]))
-    return ProcessResult("completed", report=plain_report(report_text), metrics=metrics, audit=audit)
+    return ProcessResult("completed", report=plain_report(report_text), metrics=metrics, audit=audit, publish=publish)
 
 
 PROCESSORS["yandex"] = process_yandex
@@ -382,6 +505,13 @@ PROCESSORS["seo"] = process_seo
 def execute(conf, record, uploads=None):
     root = DATA / "runs" / record["id"]
     originals = root / ("Файлы по фирмам" if conf["kind"] == "glopro" else "Исходные файлы")
+    inventoried = False
+
+    def artifact_paths():
+        return sorted(_artifact_files(root), key=(lambda p: alphabet_key(p.relative_to(root))) if conf["kind"] == "yandex" else None)
+
+    def inventory():
+        return [_file(record, p, root) for p in artifact_paths()]
 
     def progress(event):
         record["events"].append({"at": storage.now_iso(), **event})
@@ -409,44 +539,68 @@ def execute(conf, record, uploads=None):
             result = PROCESSORS[conf["kind"]](conf, record, sources, root, progress, imported=uploads is not None)
             if not isinstance(result, ProcessResult) or result.status not in {"completed", "needs_review", "no_data"}:
                 raise ValueError("Обработчик вернул некорректный результат")
-            reserved = {"id", "operator_id", "run_date", "period_start", "period_end", "trigger", "created_at", "events", "files", "finished_at", "status", "report", "error"}
+            reserved = {"id", "operator_id", "run_date", "period_start", "period_end", "trigger", "created_at", "events", "files", "finished_at", "status", "report", "error", "plan", "scope"}
             if reserved.intersection(result.metrics):
                 raise ValueError("Метрики обработчика не могут изменять сведения о запуске")
             record.update(result.metrics)
-            record.update(status=result.status, report=result.report, error=result.error)
+            record.update(report=result.report, error=result.error)
             audit = {**result.audit, "run_id": record["id"], "activation_date": record["run_date"],
                      "period": [record["period_start"], record["period_end"]],
                      "operator_sha256": hashlib.sha256(conf["markdown"].encode()).hexdigest(),
                      "sources": [{"name": Path(s["path"]).name, "sha256": hashlib.sha256(Path(s["path"]).read_bytes()).hexdigest()} for s in sources]}
+            if record.get("plan"):
+                audit["plan"] = record["plan"]
             if record.get("reused_from_run"):
                 audit["reused_from_run"] = record["reused_from_run"]
             audit_name = "Проверка SEO.json" if conf["kind"] == "seo" else "Проверка расчётов.json"
             (root / audit_name).write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
-            label = {"completed": "Готовый комплект", "no_data": "Нет операций"}.get(record["status"], "На проверку")
+            label = {"completed": "Готовый комплект", "no_data": "Нет операций"}.get(result.status, "На проверку")
             output_period = record.get("output_period", [record["period_start"], record["period_end"]])
             archive = root / f"{label} — {output_period[0]} — {output_period[1]}.zip"
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-                for path in sorted(root.rglob("*"), key=(lambda p: alphabet_key(p.relative_to(root))) if conf["kind"] == "yandex" else None):
-                    if path.is_file() and path != archive:
+                for path in artifact_paths():
+                    if path != archive:
                         bundle.write(path, path.relative_to(root))
+            record["files"] = inventory()
+            inventoried = True
+            if result.publish is not None:
+                # Persist a still-active checkpoint before changing the note.
+                # A disk/audit/ZIP/hash/DB failure here leaves the old note intact.
+                storage.save_run(record)
+                result.publish()
+            record["status"] = result.status
         except Exception as exc:
             record["status"] = "failed"
             # Connector errors must already be scrubbed; never serialize tracebacks/credentials.
             record["error"] = str(exc) if isinstance(exc, ValueError) else "Сбой выполнения. Проверьте подключение и исходные файлы; доступен повтор."
         finally:
             record["finished_at"] = storage.now_iso()
-            try:
-                record["files"] = [_file(record, p, root) for p in sorted(root.rglob("*"), key=(lambda p: alphabet_key(p.relative_to(root))) if conf["kind"] == "yandex" else None) if p.is_file()]
-            except OSError:
-                # Failure to read an artifact must not strand a running job.
-                record.update(status="failed", files=[],
-                              error="Не удалось проверить файлы результата. Проверьте доступ к каталогу запуска; доступен ручной повтор.")
+            if not inventoried:
+                try:
+                    record["files"] = inventory()
+                except OSError:
+                    # Failure to read an artifact must not strand a running job.
+                    record.update(status="failed", files=[],
+                                  error="Не удалось проверить файлы результата. Проверьте доступ к каталогу запуска; доступен ручной повтор.")
+            # An undeletable staged upload must not prevent cleanup of the rest
+            # or overwrite the calculation's outcome with a cleanup exception.
+            cleanup_failures = 0
+            if uploads:
+                for upload in uploads:
+                    try:
+                        Path(upload["path"]).unlink(missing_ok=True)
+                    except OSError:
+                        cleanup_failures += 1
+            if cleanup_failures:
+                record["events"].append({"at": storage.now_iso(), "stage": "cleanup",
+                                         "message": f"Не удалось удалить временные файлы импорта: {cleanup_failures}. Они остались в локальном каталоге приложения."})
             try:
                 storage.save_run(record)
-            finally:
-                if uploads:
-                    for upload in uploads:
-                        Path(upload["path"]).unlink(missing_ok=True)
+            except (OSError, sqlite3.Error):
+                # Only record the persistence failure; never replay a writer
+                # or handler. A persistent outage still needs startup recovery.
+                record.update(status="failed", error="Не удалось сохранить состояние запуска. Внешний результат мог быть сохранён; проверьте его перед ручным повтором.")
+                storage.save_run(record)
 
 
 def tick(now=None):
@@ -491,6 +645,8 @@ def tick(now=None):
             day = local.date() - timedelta(days=delta)
             scheduled = datetime.combine(day, time.fromisoformat(conf["schedule"]["time"]), zone)
             if not schedule_matches(conf, day) or scheduled > local or scheduled < since:
+                continue
+            if conf["kind"] == "glopro" and _schedule_satisfied(conf, day):
                 continue
             try:
                 submit(conf["id"], day.isoformat(), trigger="schedule")

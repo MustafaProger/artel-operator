@@ -4,12 +4,30 @@ import re
 
 from .ordering import alphabet_key
 from .yandex_reports import safe_label
+from .publication import save_merged_sections
 
 MARKER = re.compile(r"<!-- yandex-employee:([a-z0-9-]+) phone:([a-f0-9]{64})(?: orders:([a-f0-9]{64}))? -->")
 
 
 def sections(text):
-    headings = list(re.finditer(r"(?m)^#{1,6} +[^\n]+(?:\n|$)", text))
+    # Examples inside Markdown fences belong to the user, even if they contain
+    # a complete report with our identity marker. Keep original match offsets.
+    fences = []
+    position, opening_at, fence = 0, None, None
+    for line in text.splitlines(keepends=True):
+        if fence is not None:
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*(?:\r?\n)?", line):
+                fences.append((opening_at, position + len(line)))
+                fence = None
+        else:
+            opening = re.match(r" {0,3}(`{3,}|~{3,})([^\r\n]*)(?:\r?\n|$)", line)
+            if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+                fence, opening_at = opening[1], position
+        position += len(line)
+    if fence is not None:
+        raise ValueError("В заметке Яндекса незакрытый блок кода; автоматическое обновление остановлено")
+    headings = [heading for heading in re.finditer(r"(?m)^#{1,6} +[^\n]+(?:\n|$)", text)
+                if not any(start <= heading.start() < end for start, end in fences)]
     found = []
     for i, heading in enumerate(headings):
         end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
@@ -77,12 +95,4 @@ def merge_yandex_sections(existing, incoming):
 
 
 def save_yandex_sections(destination: Path, incoming: str):
-    existing = destination.read_text(encoding="utf-8") if destination.exists() else ""
-    updated = merge_yandex_sections(existing, incoming)
-    if existing != updated:
-        temporary = destination.with_suffix(".md.tmp")
-        try:
-            temporary.write_text(updated, encoding="utf-8")
-            temporary.replace(destination)
-        finally:
-            temporary.unlink(missing_ok=True)
+    save_merged_sections(destination, incoming, merge_yandex_sections)

@@ -9,7 +9,7 @@ import zipfile
 import pytest
 from playwright.sync_api import sync_playwright
 
-from operator_app.glopro import GloProConnector, _browser_channel
+from operator_app.glopro import GloProConnector, _browser_channel, activity_from_recent
 
 
 pytestmark = pytest.mark.skipif(
@@ -99,7 +99,8 @@ PORTAL_FIXTURE = """<!doctype html><html lang="ru"><meta charset="utf-8">
 </script></html>"""
 
 
-def test_hidden_xlsx_radio_and_late_history_do_not_break_native_download(tmp_path, monkeypatch):
+@pytest.mark.parametrize("recent_date", ["2026-09-21 12:00:00", "2026-09-22 08:00:00"])
+def test_hidden_xlsx_radio_and_late_history_do_not_break_native_download(tmp_path, monkeypatch, recent_date):
     workbook = io.BytesIO()
     with zipfile.ZipFile(workbook, "w") as archive:
         for name in ("[Content_Types].xml", "xl/workbook.xml", "xl/worksheets/sheet1.xml"):
@@ -138,7 +139,10 @@ def test_hidden_xlsx_radio_and_late_history_do_not_break_native_download(tmp_pat
             url = "https://lk.glopro.ru/clients/client/83706"
             page.goto(url)
             connector = GloProConnector("fixture-user", "fixture-password", timeout=5)
-            monkeypatch.setattr(connector, "_check_activity", lambda *args: {"has_operations": True})
+            activity = activity_from_recent({"success": True, "data": {"more": False, "items": [
+                {"DATETIME_TRN": recent_date}
+            ]}}, date(2026, 9, 18), date(2026, 9, 21))
+            monkeypatch.setattr(connector, "_check_activity", lambda *args: activity)
             xlsx_radio = page.locator('[format="xlsx"] input[type="radio"]')
             assert not xlsx_radio.is_visible()
             assert not xlsx_radio.is_checked()
@@ -150,6 +154,7 @@ def test_hidden_xlsx_radio_and_late_history_do_not_break_native_download(tmp_pat
                 date(2026, 9, 18), date(2026, 9, 21),
             )
             assert preview["checked"]
+            assert preview["activity"]["has_operations"] is (True if recent_date.startswith("2026-09-21") else None)
             assert xlsx_radio.is_checked()
             assert not xlsx_radio.is_visible()
             target = tmp_path / "report.xlsx"

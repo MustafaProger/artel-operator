@@ -4,6 +4,7 @@ import time
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from . import storage, yandex_connection
+from .network import browser_proxy
 from .yandex_reports import read_report, period_for
 from .yandex_cabinet import Cabinet, CabinetError, collect_orders, discover_employees, API, REPORTS, ID
 
@@ -33,7 +34,9 @@ def verify_page(page, company):
 
 
 def open_reports(page):
-    page.get_by_role("button", name="Отчёты", exact=True).click(timeout=60000)
+    # The cabinet's promotion toast can cover this button indefinitely. Use
+    # its normal keyboard activation, which does not interact with the toast.
+    page.get_by_role("button", name="Отчёты", exact=True).press("Enter", timeout=60000)
     page.get_by_role("button", name="Все отчёты", exact=True).wait_for(timeout=60000)
     wait_ready(page)
 
@@ -85,13 +88,23 @@ def download_employee(cabinet, page, directory, employee, start, end, company, a
     destination = directory / f"Яндекс. {employee['label']}.xlsx"
     try:
         with page.expect_download(timeout=90000) as event:
-            option.get_by_role("button", name="Скачать", exact=True).click()
+            option.get_by_role("button", name="Скачать", exact=True).press("Enter")
         event.value.save_as(temporary)
         report = read_report(temporary, start, end, company, aliases=aliases,
                              expected_orders=employee["orders"])
         if report["user_id"] != employee["user_id"] or not report["active"]:
             raise YandexError("Excel не подтвердил заправки выбранного сотрудника")
         temporary.replace(destination)
+    except Exception:
+        if temporary.is_file():
+            rejected = directory / "На проверку" / f"{identity}.xlsx"
+            rejected.parent.mkdir(mode=0o700, exist_ok=True)
+            temporary.chmod(0o600)
+            temporary.replace(rejected)
+            progress({"stage": "validation_failed", "report_id": identity,
+                      "user_id": employee["user_id"], "source_path": str(rejected),
+                      "message": "Исходный Excel сохранён для проверки; итог не опубликован"})
+        raise
     finally:
         temporary.unlink(missing_ok=True)
     progress({"stage": "downloaded", "client": employee["name"], "user_id": employee["user_id"],
@@ -107,8 +120,9 @@ def download_reports(conf, record, directory, progress):
     results = []
     step = "открытие кабинета"
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        with browser_proxy(allowed_hosts=(".yandex.ru", ".yandex.net", ".yastatic.net",
+                                         ".yandex.com", ".yango.com", ".yango.tech")) as proxy, sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, **({"proxy": proxy} if proxy else {}))
             context = browser.new_context(storage_state=str(yandex_connection.session_path()),
                 locale="ru-RU", timezone_id="Europe/Moscow", accept_downloads=True)
             page = context.new_page()

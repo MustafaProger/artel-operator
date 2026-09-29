@@ -8,6 +8,14 @@ import re
 from openpyxl import load_workbook, Workbook
 from .ordering import alphabet_key
 
+# The cabinet distinguishes who cancelled a zero-value order. Keep these raw
+# statuses in the manifest; Excel uses the common cancellation label.
+# StationCanceled and UserCanceled were verified in the live cabinet 2026-09-29.
+CANCELLED_ORDER_STATUSES = frozenset({"Cancelled", "StationCanceled", "UserCanceled"})
+# A real 2026-09-29 XLSX omits these cabinet-only zero cancellations. Other
+# statuses (including zero-valued Completed) must still be present in Excel.
+XLSX_OMITTED_CANCELLATION_STATUSES = frozenset({"StationCanceled", "UserCanceled"})
+
 
 def period_for(run_date):
     if run_date.weekday() != 1:
@@ -87,7 +95,27 @@ def read_report(path, start, end, company, employees=None, *, aliases=(), expect
     cost_column = columns["Стоимость"]
     operations, ids, found_employees, footer = [], set(), {}, None
     checked_orders = []
-    expected = {o["id"]: o for o in expected_orders} if expected_orders is not None else None
+    expected = None
+    if expected_orders is not None:
+        expected = {}
+        for order in expected_orders:
+            # Recheck the saved manifest at the XLSX boundary as well as at API
+            # collection. A dict comprehension can silently discard a duplicate
+            # with different amounts; omitted cancellations have no Excel row
+            # against which their date could otherwise be checked.
+            try:
+                required = ("id", "user_id", "source_name", "phone_sha256", "date", "created_at", "status", "litres", "amount")
+                if not isinstance(order, dict) or any(not isinstance(order.get(key), str) for key in required):
+                    raise ValueError()
+                if (not re.fullmatch(r"[0-9a-f]{32}", order["id"])
+                        or not re.fullmatch(r"[0-9a-f]{32}", order["user_id"])
+                        or order["id"] in expected or not start <= date.fromisoformat(order["date"]) <= end):
+                    raise ValueError()
+                number(order["litres"])
+                number(order["amount"])
+            except (TypeError, ValueError):
+                raise ValueError("Манифест Яндекса содержит повтор ID, некорректные данные или дату вне периода") from None
+            expected[order["id"]] = order
     for row in rows[7:]:
         if not any(value is not None for value in row):
             continue
@@ -152,7 +180,7 @@ def read_report(path, start, end, company, employees=None, *, aliases=(), expect
                     or day.isoformat() != order["date"]):
                 raise ValueError("Строка Excel не совпала с суммой, литрами или датой заказа в кабинете")
         if status in {"отменен", "отменен пользователем"} and litres == amount == 0:
-            if expected is not None and expected[order_id]["status"] != "Cancelled":
+            if expected is not None and expected[order_id]["status"] not in CANCELLED_ORDER_STATUSES:
                 raise ValueError("Статус Excel не совпал с кабинетом")
             continue
         if expected is not None and expected[order_id]["status"] != "Completed":
@@ -171,9 +199,20 @@ def read_report(path, start, end, company, employees=None, *, aliases=(), expect
         raise ValueError("Сумма операций Яндекса не совпадает с итогами файла")
     if not found_employees:
         raise ValueError("В пустом файле Яндекса невозможно подтвердить сотрудника; такой файл не нужен")
-    if expected is not None and ids != set(expected):
-        raise ValueError("Состав Excel не совпал с полной выборкой заказов кабинета")
     employee_id, employee = next(iter(found_employees.items()))
+    omitted_cancellations = []
+    if expected is not None:
+        missing = [order for order_id, order in expected.items() if order_id not in ids]
+        invalid = [order for order in missing
+                   if order["status"] not in XLSX_OMITTED_CANCELLATION_STATUSES
+                   or number(order["litres"]) != 0 or number(order["amount"]) != 0
+                   or order["user_id"] != employee.get("user_id")]
+        if invalid:
+            details = ", ".join(order["id"] for order in invalid[:10])
+            raise ValueError("Состав Excel не совпал с полной выборкой заказов кабинета; "
+                             "отсутствуют обязательные заказы: " + details)
+        omitted_cancellations = [{key: order[key] for key in ("id", "status", "date", "litres", "amount")}
+                                 for order in missing]
     if expected:
         latest = max(expected.values(), key=lambda o: o["created_at"])
         employee = dict(employee, source_name=latest["source_name"], phone_sha256=latest["phone_sha256"],
@@ -184,6 +223,8 @@ def read_report(path, start, end, company, employees=None, *, aliases=(), expect
             "identity_basis": ("cabinet_user_id" if expected is not None else "configured_user_id") if employee.get("user_id") else "xlsx_phone_sha256", "period": [start.isoformat(), end.isoformat()],
             "litres": str(sum((Decimal(o["litres"]) for o in operations), Decimal(0))),
             "amount": str(total), "order_count": len(ids), "operations": operations,
+            "cabinet_order_count": len(expected) if expected is not None else None,
+            "cabinet_only_zero_cancellations": omitted_cancellations,
             "active": any(Decimal(o["litres"]) > 0 for o in operations)}
 
 

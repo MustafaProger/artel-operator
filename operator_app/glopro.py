@@ -21,6 +21,7 @@ import zipfile
 from .clients import client_is_excluded, validate_excluded_clients
 from .calculator import weekly_kind
 from .ordering import alphabet_key
+from .network import browser_proxy
 
 ORIGIN = "https://lk.glopro.ru"
 FORM = "#reports2"
@@ -37,7 +38,8 @@ def activity_from_recent(payload, first, last):
 
     Empty is proven only when this window reaches before the requested period
     (or the portal explicitly reports no history). Never interpret more=False
-    as complete historical coverage.
+    as complete historical coverage. A window entirely after the period is
+    inconclusive: obtain the period's XLSX and let the source validator decide.
     """
     if payload == {"success": False, "data": False, "messages": []}:
         return {"has_operations": False, "evidence": "no_contract_transactions"}
@@ -58,7 +60,8 @@ def activity_from_recent(payload, first, last):
         return {**evidence, "has_operations": True}
     if timestamps[-1].date() < first:
         return {**evidence, "has_operations": False}
-    raise GloProError("Последние транзакции не покрывают выбранный период. Автоматическая выгрузка остановлена: нельзя подтвердить, есть ли заправки. Используйте импорт отчёта за этот период.")
+    return {**evidence, "has_operations": None, "requires_period_report": True,
+            "reason": "recent_window_after_period"}
 
 
 def _browser_channel() -> str | None:
@@ -80,7 +83,7 @@ def _transport_mode() -> str:
     return mode
 
 
-def _route_request(route, transport: str) -> None:
+def _route_request(route, transport: str, *, report_timeout: int = 120_000) -> None:
     """Bridge only GloPro through Playwright's verified HTTPS API transport.
 
     Keep original requests intact, including POST bodies, without logging them.
@@ -94,7 +97,11 @@ def _route_request(route, transport: str) -> None:
         }:
             route.abort()
         elif transport == "api" and parsed.scheme == "https" and parsed.netloc == "lk.glopro.ru":
-            response = route.fetch(max_redirects=0, max_retries=0, timeout=20_000)
+            # Generation can take longer than an ordinary page request. Keep
+            # its transport alive for the same bounded budget as _download.
+            generating = route.request.method == "GET" and parsed.path.rstrip("/") == "/reports/generate"
+            response = route.fetch(max_redirects=0, max_retries=0,
+                                   timeout=report_timeout if generating else 20_000)
             route.fulfill(response=response)
         else:
             route.continue_()
@@ -310,9 +317,11 @@ class GloProConnector:
         except ImportError:
             raise GloProError("Не установлен Playwright. Установите зависимости приложения и Chromium.") from None
         channel, transport = _browser_channel(), _transport_mode()
-        with sync_playwright() as playwright:
+        with browser_proxy(allowed_hosts=("lk.glopro.ru",)) as proxy, sync_playwright() as playwright:
             try:
                 launch_options = {"headless": self._headless}
+                if proxy:
+                    launch_options["proxy"] = proxy
                 if channel:
                     launch_options["channel"] = channel
                 browser = playwright.chromium.launch(**launch_options)
@@ -322,7 +331,7 @@ class GloProConnector:
                 raise GloProError("Не удалось запустить Chromium. Выполните: python -m playwright install chromium") from None
             try:
                 context = browser.new_context(accept_downloads=True, locale="ru-RU", timezone_id="Europe/Moscow")
-                context.route("**/*", lambda route: _route_request(route, transport))
+                context.route("**/*", lambda route: _route_request(route, transport, report_timeout=int(self._timeout * 1000)))
                 context.set_default_timeout(30_000)
                 context.set_default_navigation_timeout(30_000)
                 yield context.new_page()
@@ -509,10 +518,14 @@ class GloProConnector:
         selector.wait_for(state="attached")
         ids = selector.locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
         contracts = []
+        seen = set()
         observed = {c["id"]: c["url"] for c in client.get("contracts", [])}
         for ident in ids:
             if not str(ident).isdigit():
                 raise GloProError("В списке договоров GloPro появился неизвестный идентификатор.")
+            if str(ident) in seen:
+                raise GloProError("В списке договоров GloPro повторяется ID; повторная генерация отчёта запрещена.")
+            seen.add(str(ident))
             # URL shape and parameter are verified from the portal's own contract links.
             contracts.append({"id": str(ident), "url": observed.get(str(ident), client["url"] + "?contract_id=" + str(ident))})
         return contracts
@@ -555,7 +568,7 @@ class GloProConnector:
         account_preview = self._read_account_preview(page)
         activity = self._check_activity(page, contract, first, last)
         account_preview["activity"] = activity
-        if not activity["has_operations"]:
+        if activity["has_operations"] is False:
             return account_preview
         page.locator('.ajax_contract_block a[href="#reports"][ajax_tab]').click()
         select = page.locator(FORM + " select.report_select")
@@ -606,20 +619,37 @@ class GloProConnector:
     def _download(self, page, destination: Path):
         expected = self._download_parameters(page)
         downloaded = []
+        failures = []
 
         def listener(download):
             if _matches_report_download(download.url, expected):
                 downloaded.append(download)
 
+        def failed_request(request):
+            # Chromium normally cancels a navigation with ERR_ABORTED when it
+            # hands an attachment to the download manager. That is not a failure.
+            if _matches_report_download(request.url, expected) and request.failure != "net::ERR_ABORTED":
+                failures.append("GloPro прервал запрос формирования отчёта. Проверьте доступность сервиса и повторите запуск.")
+
+        def failed_response(response):
+            if _matches_report_download(response.url, expected) and response.status >= 400:
+                failures.append(f"GloPro вернул ошибку HTTP {response.status} при формировании отчёта. Повторите запуск позже.")
+
         # A new window can emit its attachment on the opener or on the popup.
         # Listen at context level before clicking, and bind it to the form scope.
         page.context.on("download", listener)
+        page.context.on("requestfailed", failed_request)
+        page.context.on("response", failed_response)
         try:
             # Only click Generate once. Retrying this operation could create duplicates.
-            page.locator(FORM + ' .report_template_block:visible span[onclick="generateReport($(this))"]').click()
-            deadline = time.monotonic() + self._timeout
-            while not downloaded and time.monotonic() < deadline:
+            # Route callbacks can run while click() waits; allow the report's
+            # full transport budget and a short grace for the download event.
+            deadline = time.monotonic() + self._timeout + 5
+            page.locator(FORM + ' .report_template_block:visible span[onclick="generateReport($(this))"]').click(timeout=int((self._timeout + 5) * 1000))
+            while not downloaded and not failures and time.monotonic() < deadline:
                 page.wait_for_timeout(200)
+            if failures:
+                raise GloProError(failures[0])
             if len(downloaded) != 1:
                 raise GloProError("GloPro не выдал файл для выбранной фирмы, договора и периода вовремя. Старые файлы из очереди не используются.")
             download = downloaded[0]
@@ -639,6 +669,8 @@ class GloProConnector:
             raise GloProError("Скачивание нового отчёта GloPro прервано. Проверьте доступность сервиса и повторите запуск.") from None
         finally:
             page.context.remove_listener("download", listener)
+            page.context.remove_listener("requestfailed", failed_request)
+            page.context.remove_listener("response", failed_response)
 
     def check_connection(self) -> dict:
         try:
@@ -651,8 +683,7 @@ class GloProConnector:
         except Exception:
             raise GloProError("Не удалось проверить подключение GloPro. Сервис недоступен или его интерфейс изменился.") from None
 
-    def download_reports(self, start: str, end: str, output_dir: Path, clients: list[dict | str] | None = None, progress: Progress | None = None, excluded_clients: list[dict] | None = None, *, run_date: str | None = None) -> list[dict]:
-        from .config import client_period_for
+    def download_reports(self, start: str, end: str, output_dir: Path, clients: list[dict | str] | None = None, progress: Progress | None = None, excluded_clients: list[dict] | None = None, *, run_date: str | None = None, plan: dict | None = None) -> list[dict]:
         first, last = _period(start, end)
         scheduled_date = date.fromisoformat(run_date) if run_date else last + timedelta(days=1)
         exclusions = [] if excluded_clients is None else excluded_clients
@@ -679,11 +710,21 @@ class GloProConnector:
                     if client_is_excluded(client, exclusions):
                         notify({"stage": "skipped", "message": f"Временно пропущен по настройке: {client['name']}", "client": client["name"], "client_id": client["id"], "reason": "excluded_client"})
                     else:
-                        period = client_period_for(scheduled_date, client["name"], client["id"])
+                        weekly = weekly_kind(client["name"], client["id"])
+                        if plan is not None:
+                            selected_period = plan["weekly_period" if weekly else "ordinary_period"]
+                            period = _period(*selected_period) if selected_period else None
+                        elif weekly:
+                            period = (scheduled_date - timedelta(days=7), scheduled_date - timedelta(days=1)) if scheduled_date.weekday() == 1 else None
+                        else:
+                            # The executor has already selected the accounting
+                            # period. Execution date does not redefine it.
+                            period = first, last
                         if period is None:
-                            notify({"stage": "skipped", "message": f"Только вторничный запуск: {client['name']}", "client": client["name"], "client_id": client["id"], "reason": "tuesday_only"})
+                            reason = "tuesday_only" if weekly else "ordinary_run_moved"
+                            notify({"stage": "skipped", "message": f"В этот запуск по календарю не входит: {client['name']}", "client": client["name"], "client_id": client["id"], "reason": reason})
                             continue
-                        periods[client["id"]] = period if run_date or weekly_kind(client["name"], client["id"]) else (first, last)
+                        periods[client["id"]] = period
                         eligible.append(client)
                 selected = sorted(eligible, key=lambda client: alphabet_key(client["name"]))
                 if not selected:
@@ -703,13 +744,19 @@ class GloProConnector:
                                     "contract_id": contract["id"], "period": [client_first.isoformat(), client_last.isoformat()],
                                     "evidence": account_preview["activity"], "message": f"Нет заправок, XLSX не запрашивается: {client['name']}"})
                             continue
+                        if account_preview.get("activity", {}).get("requires_period_report"):
+                            notify({"stage": "activity_fallback", "reason": "recent_window_after_period",
+                                    "client": client["name"], "client_id": client["id"], "contract_id": contract["id"],
+                                    "period": [client_first.isoformat(), client_last.isoformat()],
+                                    "evidence": account_preview["activity"],
+                                    "message": f"Последние операции новее периода; проверяем полный XLSX: {client['name']}"})
                         folder = output_dir / ("Договор " + contract["id"]) if len(contracts) > 1 else output_dir
                         folder.mkdir(parents=True, exist_ok=True)
                         reserved = reserved_by_dir.setdefault(str(folder), {p.name.casefold() for p in folder.iterdir()})
                         path = folder / _filename(client["name"], client["id"], reserved)
                         metadata = self._download(page, path)
                         results.append({"client": client["name"], "client_id": client["id"], "contract_id": contract["id"], "account_checked": account_preview["checked"], "account_preview": account_preview, "template": "Транзакционный отчет со скидкой", "path": str(path), "start": client_first.isoformat(), "end": client_last.isoformat(), **metadata})
-                notify({"stage": "downloaded", "message": "Проверены все фирмы; скачаны отчёты с операциями", "total": len(results), "activity_check_complete": True})
+                notify({"stage": "downloaded", "message": "Проверены все фирмы; скачаны исходные отчёты для расчёта", "total": len(results), "activity_check_complete": True})
                 return results
         except GloProError:
             raise

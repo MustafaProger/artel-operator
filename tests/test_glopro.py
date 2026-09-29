@@ -2,6 +2,7 @@
 import tempfile
 import io
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from datetime import date
 from pathlib import Path
 import shutil
 import unittest
@@ -13,7 +14,7 @@ import zipfile
 from operator_app.glopro import (
     GloProConnector, GloProError, _filename, _period, _select_requested,
     _validate_workbook, _PaginationEvidence, _browser_channel, _route_request, _transport_mode,
-    _matches_report_download,
+    _matches_report_download, activity_from_recent,
 )
 from operator_app.clients import client_is_excluded
 
@@ -129,7 +130,7 @@ class DownloadLocator:
     def evaluate_all(self, script, *args):
         raise AssertionError("Native report downloads must not inspect or click queue history")
 
-    def click(self):
+    def click(self, **kwargs):
         assert self.generate
         self.page.generate_count += 1
         self.page.emit_due()
@@ -138,15 +139,17 @@ class DownloadLocator:
 class DownloadContext:
     def __init__(self):
         self.listener = None
+        self.listeners = {}
 
     def on(self, event, callback):
-        assert event == "download"
-        self.listener = callback
+        if event == "download":
+            self.listener = callback
+        self.listeners[event] = callback
 
     def remove_listener(self, event, callback):
-        assert event == "download"
-        assert callback is self.listener
-        self.listener = None
+        assert callback is self.listeners.pop(event)
+        if event == "download":
+            self.listener = None
 
 
 class DownloadPage(FakePage):
@@ -208,6 +211,19 @@ class GloProTests(unittest.TestCase):
         self.assertEqual([name for name, _ in route.calls], ["fetch", "fulfill", "dispose"])
         self.assertEqual(route.calls[0][1], {"max_redirects": 0, "max_retries": 0, "timeout": 20000})
         self.assertIs(route.calls[1][1]["response"], route.response)
+
+    def test_report_transport_honors_generation_budget_without_retries(self):
+        route = self.Route(url=report_url())
+        route.request.method = "GET"
+        _route_request(route, "api", report_timeout=135000)
+        self.assertEqual(route.calls[0], ("fetch", {"max_redirects": 0, "max_retries": 0, "timeout": 135000}))
+        self.assertEqual([name for name, _ in route.calls], ["fetch", "fulfill", "dispose"])
+        for url, method in [("https://lk.glopro.ru/clients", "GET"), (report_url(), "POST"),
+                            ("https://lk.glopro.ru/reports/generate/other", "GET")]:
+            route = self.Route(url=url)
+            route.request.method = method
+            _route_request(route, "api", report_timeout=135000)
+            self.assertEqual(route.calls[0][1]["timeout"], 20000)
 
     def test_bridge_is_scoped_to_exact_https_origin(self):
         for url in ["http://lk.glopro.ru/", "https://lk.glopro.ru.evil.example/", "https://another.example/", "https://lk.glopro.ru:8443/", "https://user@lk.glopro.ru/"]:
@@ -421,6 +437,45 @@ class GloProTests(unittest.TestCase):
             self.download_clients(available, folder, exclusions, events, clients=["Китай"])
         self.assertNotIn("downloaded", [event["stage"] for event in events])
 
+    def test_busy_client_with_latest_ten_after_period_downloads_exact_weekly_source(self):
+        # Tuesday morning can already have ten newer operations. more=False
+        # describes the preview, not an empty preceding Tuesday–Monday week.
+        activity = activity_from_recent({"success": True, "data": {"more": False, "items": [
+            {"DATETIME_TRN": f"2026-09-29 08:{minute:02d}:00"} for minute in range(10, 0, -1)
+        ]}}, date(2026, 9, 22), date(2026, 9, 28))
+        self.assertIsNone(activity["has_operations"])
+        connector = GloProConnector("x", "y")
+        events = []
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(connector, "_browser_page", return_value=nullcontext(FakePage())), \
+                patch.object(connector, "_login"), \
+                patch.object(connector, "_list_clients", return_value=[{"id": "78749", "name": "Китай"}]), \
+                patch.object(connector, "_contracts", return_value=[{"id": "10"}]), \
+                patch.object(connector, "_prepare_report", return_value={"checked": True, "activity": activity}) as prepare, \
+                patch.object(connector, "_download", side_effect=lambda page, path: (workbook(path), _validate_workbook(path))[1]) as download:
+            result = connector.download_reports("2026-09-25", "2026-09-28", Path(folder), progress=events.append, run_date="2026-09-29")
+            download.assert_called_once()
+            self.assertEqual(prepare.call_args.args[-2:], (date(2026, 9, 22), date(2026, 9, 28)))
+            self.assertTrue(Path(result[0]["path"]).is_file())
+        self.assertEqual((result[0]["start"], result[0]["end"]), ("2026-09-22", "2026-09-28"))
+        self.assertIsNone(result[0]["account_preview"]["activity"]["has_operations"])
+        self.assertEqual([event["stage"] for event in events], ["connecting", "clients", "downloading", "activity_fallback", "downloaded"])
+        self.assertEqual(events[-2]["evidence"]["checked_rows"], 10)
+
+    def test_inconclusive_activity_cannot_turn_failed_download_into_empty_success(self):
+        connector = GloProConnector("x", "y", timeout=1)
+        events = []
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(connector, "_browser_page", return_value=nullcontext(FakePage())), \
+                patch.object(connector, "_login"), \
+                patch.object(connector, "_list_clients", return_value=[{"id": "1", "name": "Фирма"}]), \
+                patch.object(connector, "_contracts", return_value=[{"id": "10"}]), \
+                patch.object(connector, "_prepare_report", return_value={"checked": True, "activity": {"has_operations": None, "requires_period_report": True}}), \
+                patch.object(connector, "_download", side_effect=GloProError("Источник недоступен")):
+            with self.assertRaisesRegex(GloProError, "Источник недоступен"):
+                connector.download_reports("2026-09-25", "2026-09-28", Path(folder), progress=events.append)
+        self.assertFalse(any(event.get("reason") == "no_operations" or event.get("activity_check_complete") for event in events))
+
     def test_exclusions_cannot_bypass_client_list_completeness(self):
         connector = GloProConnector("x", "y")
         with tempfile.TemporaryDirectory() as folder, \
@@ -597,6 +652,64 @@ class GloProTests(unittest.TestCase):
             self.assertEqual(page.generate_count, 1)
             self.assertEqual(page.listeners, {})
             self.assertIsNone(page.context.listener)
+
+    def test_native_navigation_abort_is_not_download_failure(self):
+        class NativeAbortPage(DownloadPage):
+            def emit_due(self):
+                self.context.listeners["requestfailed"](SimpleNamespace(url=report_url(), failure="net::ERR_ABORTED"))
+                super().emit_due()
+
+        with tempfile.TemporaryDirectory() as folder:
+            source, destination = Path(folder) / "source.xlsx", Path(folder) / "result.xlsx"
+            workbook(source)
+            page = NativeAbortPage(source, delay=0.2)
+            self.download_report(page, destination)
+            self.assertTrue(destination.exists())
+        self.assertEqual(page.generate_count, 1)
+        self.assertFalse(page.context.listeners)
+
+    def test_matching_transport_failure_stops_without_waiting_or_regenerating(self):
+        class FailedPage(DownloadPage):
+            def emit_due(self):
+                self.context.listeners["requestfailed"](SimpleNamespace(url=report_url(), failure="net::ERR_FAILED SECRET_TOKEN"))
+
+        page = FailedPage()
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder) / "result.xlsx"
+            with self.assertRaisesRegex(GloProError, "прервал запрос") as failure:
+                self.download_report(page, destination)
+            self.assertFalse(destination.exists())
+        self.assertNotIn("SECRET_TOKEN", str(failure.exception))
+        self.assertEqual(page.clock, 0)
+        self.assertEqual(page.generate_count, 1)
+        self.assertFalse(page.context.listeners)
+
+    def test_report_http_error_is_actionable_and_unrelated_errors_are_ignored(self):
+        class ResponsePage(DownloadPage):
+            def emit_due(self):
+                self.context.listeners["response"](SimpleNamespace(url=report_url(), status=503))
+
+        page = ResponsePage()
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(GloProError, "HTTP 503"):
+                self.download_report(page, Path(folder) / "result.xlsx")
+        self.assertEqual(page.clock, 0)
+        self.assertEqual(page.generate_count, 1)
+        self.assertFalse(page.context.listeners)
+
+        class UnrelatedPage(DownloadPage):
+            def emit_due(self):
+                self.context.listeners["response"](SimpleNamespace(url=report_url(client_choose_single="999"), status=503))
+                self.context.listeners["requestfailed"](SimpleNamespace(url="https://lk.glopro.ru/clients", failure="net::ERR_FAILED"))
+                super().emit_due()
+
+        with tempfile.TemporaryDirectory() as folder:
+            source, destination = Path(folder) / "source.xlsx", Path(folder) / "result.xlsx"
+            workbook(source)
+            page = UnrelatedPage(source)
+            self.download_report(page, destination)
+            self.assertTrue(destination.exists())
+        self.assertFalse(page.context.listeners)
 
     def test_unrelated_downloads_never_replace_matching_native_report(self):
         with tempfile.TemporaryDirectory() as folder:

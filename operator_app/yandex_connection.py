@@ -9,6 +9,7 @@ import tempfile
 import time
 
 from . import storage
+from .network import browser_proxy
 
 URL = "https://business.taxi.yandex.ru/orders-v2/list/tanker"
 COMPANY = "ООО НК АРТЭЛЬ"
@@ -66,8 +67,9 @@ def login():
     from playwright.sync_api import sync_playwright
     storage.set_setting("yandex_connection_pid", os.getpid())
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
+        with browser_proxy(allowed_hosts=(".yandex.ru", ".yandex.net", ".yastatic.net",
+                                         ".yandex.com", ".yango.com", ".yango.tech")) as proxy, sync_playwright() as p:
+            browser = p.chromium.launch(headless=False, **({"proxy": proxy} if proxy else {}))
             context = browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow",
                                           storage_state=str(session_path()) if session_path().is_file() else None)
             page = context.new_page()

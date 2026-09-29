@@ -44,7 +44,10 @@ def test_latest_ten_is_not_treated_as_full_history():
     assert not activity_from_recent(payload('2026-09-14 23:59:59'), first, last)['has_operations']
     assert not activity_from_recent(payload('2026-09-22 00:00:00', '2026-09-14 23:59:59'), first, last)['has_operations']
     assert not activity_from_recent({'success': False, 'data': False, 'messages': []}, first, last)['has_operations']
-    for obj in [payload('2026-09-22 00:00:00'), payload(), {}, [], {'success': False, 'data': False, 'messages': ['Ошибка']}, payload('2026-09-14 00:00:00', '2026-09-20 00:00:00')]:
+    unknown = activity_from_recent(payload('2026-09-22 00:00:00'), first, last)
+    assert unknown['has_operations'] is None
+    assert unknown['requires_period_report']
+    for obj in [payload(), {}, [], {'success': False, 'data': False, 'messages': ['Ошибка']}, payload('2026-09-14 00:00:00', '2026-09-20 00:00:00')]:
         with pytest.raises(GloProError):
             activity_from_recent(obj, first, last)
 

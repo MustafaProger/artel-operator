@@ -1,9 +1,17 @@
 """Replace only addressed company sections, preserving the rest of a daily note."""
+import os
 import re
+import tempfile
 from pathlib import Path
+from threading import Lock
+from typing import Callable
 
 from .calculator import company_identity
 from .ordering import alphabet_key
+
+# The supported runtime has one process. Serialize its note read/merge/replace
+# operations; unique staging names also avoid touching a stale temporary file.
+PUBLICATION_LOCK = Lock()
 
 
 def sort_report_sections(text):
@@ -28,9 +36,25 @@ def sort_report_sections(text):
 def _sections(text):
     # A company ends at the next peer or parent heading; deeper headings remain
     # part of its report and are replaced along with the company's content.
-    headings = list(re.finditer(r"(?m)^(#{1,3})[ \t]+([^\r\n]+)(?:\r?\n|$)", text))
-    return [(company_identity(match[2]), match.start(), headings[index + 1].start() if index + 1 < len(headings) else len(text))
-            for index, match in enumerate(headings) if match[1] == "###"]
+    headings = []
+    position, fence = 0, None
+    for line in text.splitlines(keepends=True):
+        if fence is not None:
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*(?:\r?\n)?", line):
+                fence = None
+        else:
+            opening = re.match(r" {0,3}(`{3,}|~{3,})([^\r\n]*)(?:\r?\n|$)", line)
+            if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+                fence = opening[1]
+            else:
+                heading = re.match(r" {0,3}(#{1,3})[ \t]+([^\r\n]+)(?:\r?\n|$)", line)
+                if heading:
+                    headings.append((heading[1], heading[2], position))
+        position += len(line)
+    if fence is not None:
+        raise ValueError("Незакрытый блок кода в заметке; закройте его перед публикацией отчёта.")
+    return [(company_identity(name), start, headings[index + 1][2] if index + 1 < len(headings) else len(text))
+            for index, (level, name, start) in enumerate(headings) if level == "###"]
 
 
 def update_report_sections(existing: str, incoming: str) -> str:
@@ -59,13 +83,25 @@ def update_report_sections(existing: str, incoming: str) -> str:
     return sort_report_sections(result)
 
 
-def save_report_sections(destination: Path, report: str) -> None:
-    existing = destination.read_text(encoding="utf-8") if destination.exists() else ""
-    updated = update_report_sections(existing, report)
-    if updated != existing:
-        temporary = destination.with_suffix(".md.tmp")
+def save_merged_sections(destination: Path, incoming: str, merge: Callable[[str, str], str]) -> None:
+    """Serialize a local note merge and replace it using a private staging file."""
+    with PUBLICATION_LOCK:
+        existing = destination.read_text(encoding="utf-8") if destination.exists() else ""
+        updated = merge(existing, incoming)
+        if updated == existing:
+            return
+        descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+        os.close(descriptor)
+        temporary = Path(name)
         try:
             temporary.write_text(updated, encoding="utf-8")
+            # Preserve an existing note's mode. New financial notes remain 0600.
+            if destination.exists():
+                temporary.chmod(destination.stat().st_mode & 0o777)
             temporary.replace(destination)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def save_report_sections(destination: Path, report: str) -> None:
+    save_merged_sections(destination, report, update_report_sections)

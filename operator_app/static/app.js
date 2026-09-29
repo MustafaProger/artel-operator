@@ -30,6 +30,7 @@
   const svg = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true">${icons[name] || icons.document}</svg>`;
   const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
   const state = { operators: [], runs: [], connection: {}, loaded: false, pending: false, currentView: 'overview', editorId: '', originalMarkdown: '', editorDirty: false, editorLoading: false, detailId: null, lastStateSignature: '', refreshing: false };
+  const previews = { run: { request: 0, plan: null }, import: { request: 0, plan: null } };
   const pageNames = { overview: 'Обзор', operators: 'Операторы', runs: 'История запусков', instructions: 'Инструкции', settings: 'Подключения' };
   const activeStatuses = new Set(['running', 'pending', 'queued', 'downloading', 'calculating', 'processing']);
   const successStatuses = new Set(['success', 'completed', 'complete', 'succeeded', 'ready']);
@@ -55,28 +56,8 @@
     return new Intl.DateTimeFormat('ru-RU', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit' }).format(date);
   }
 
-  function moscowDate() {
-    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
-    const part = (type) => parts.find((item) => item.type === type).value;
-    return `${part('year')}-${part('month')}-${part('day')}`;
-  }
-
-  function scheduledDate(kind = 'glopro') {
-    if (kind === 'seo') return moscowDate();
-    const date = new Date(`${moscowDate()}T12:00:00Z`);
-    while (!(kind === 'yandex' ? [2] : [2, 5]).includes(date.getUTCDay())) date.setUTCDate(date.getUTCDate() - 1);
-    return date.toISOString().slice(0, 10);
-  }
-
-  function periodForDate(value, kind = 'glopro') {
-    const date = new Date(`${value}T12:00:00Z`);
-    if (kind === 'seo') return Number.isFinite(date.getTime()) ? { start: value, end: value } : null;
-    if (!Number.isFinite(date.getTime()) || !(kind === 'yandex' ? [2] : [2, 5]).includes(date.getUTCDay())) return null;
-    const start = new Date(date);
-    const end = new Date(date);
-    start.setUTCDate(date.getUTCDate() - (kind === 'yandex' ? 7 : date.getUTCDay() === 2 ? 4 : 3));
-    end.setUTCDate(date.getUTCDate() - 1);
-    return { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) };
+  function scheduledDate(operatorId) {
+    return state.operators.find((operator) => operator.id === operatorId)?.latest_plan?.run_date || '';
   }
 
   const periodLabel = (start, end) => `${formatDate(start)} — ${formatDate(end, { year: 'numeric' })}`;
@@ -84,6 +65,65 @@
   const operatorName = (id) => state.operators.find((operator) => operator.id === id)?.name || id || 'Оператор';
   const runStatus = (run) => String(run.status || '').toLowerCase();
   const isActive = () => state.pending || state.runs.some((run) => activeStatuses.has(runStatus(run)));
+
+  function planText(plan, kind, compact = false) {
+    if (!plan) return 'Период пока не определён.';
+    if (plan.error) return plan.error;
+    if (kind === 'seo') return compact ? `Выпуск ${formatDate(plan.run_date, { year: 'numeric' })}` : 'Одна новая статья в актуальном четырёхдневном выпуске. Новая обложка и статья сохраняются в CMS. Повтор использует тот же текст и изображение.';
+    if (kind === 'yandex') return `Яндекс: ${periodLabel(plan.period_start, plan.period_end)}${compact ? '.' : ', полные сутки по Москве. Все сотрудники с заправками будут определены по заказам недели.'}`;
+    const parts = [];
+    if (plan.kind === 'month_close') parts.push('Закрытие месяца.');
+    if (plan.kind === 'weekly_only') parts.push('Только недельные фирмы. Обычные фирмы в этот день пропускаются.');
+    if (plan.ordinary_period) parts.push(`Обычные фирмы: ${periodLabel(...plan.ordinary_period)}.`);
+    if (plan.weekly_period) parts.push(`Китай и НК АРТЭЛЬ: ${periodLabel(...plan.weekly_period)}.`);
+    else if (!compact) parts.push('Китай и НК АРТЭЛЬ в этом запуске пропускаются.');
+    if (plan.moved_from) parts.push(`Обычное актирование перенесено с ${formatDate(plan.moved_from, { year: 'numeric' })}.`);
+    if (plan.ordinary_moved_to) parts.push(`Обычное актирование: ${formatDate(plan.ordinary_moved_to, { year: 'numeric' })}.`);
+    if (plan.from_history) parts.push('Используется период, сохранённый в истории.');
+    if (!compact) parts.push('Все границы включительные, полные сутки по Москве.');
+    return parts.join(' ');
+  }
+
+  function previewKey(prefix) {
+    return `${$(`${prefix}-operator`).value}:${$(`${prefix}-date`).value}`;
+  }
+
+  function validPreview(prefix) {
+    const preview = previews[prefix];
+    return !preview.loading && preview.key === previewKey(prefix) && preview.plan?.can_run === true;
+  }
+
+  function updatePlanButtons() {
+    for (const prefix of ['run', 'import']) $(`${prefix}-submit`).disabled = isActive() || !validPreview(prefix);
+  }
+
+  function requestPeriodPreview(prefix, delay = 150) {
+    const preview = previews[prefix];
+    const request = ++preview.request;
+    clearTimeout(preview.timer);
+    preview.key = previewKey(prefix);
+    preview.plan = null;
+    preview.loading = true;
+    const operatorId = $(`${prefix}-operator`).value;
+    const day = $(`${prefix}-date`).value;
+    const label = $(`${prefix}-period-preview`);
+    label.textContent = day && operatorId ? 'Проверяем дату и период…' : 'Выберите дату планового актирования.';
+    updatePlanButtons();
+    if (!day || !operatorId) { preview.loading = false; return; }
+    preview.timer = window.setTimeout(async () => {
+      try {
+        const plan = await api(`/api/operators/${encodeURIComponent(operatorId)}/plan?run_date=${encodeURIComponent(day)}`, { timeout: 15000 });
+        if (request !== preview.request || preview.key !== previewKey(prefix)) return;
+        preview.plan = plan;
+        label.textContent = planText(plan, selectedKind(`${prefix}-operator`)) + (plan.future ? ' Это будущая дата; запуск станет доступен в день актирования.' : '');
+      } catch (error) {
+        if (request !== preview.request || preview.key !== previewKey(prefix)) return;
+        label.textContent = error.message;
+      } finally {
+        if (request === preview.request) { preview.loading = false; updatePlanButtons(); }
+      }
+    }, delay);
+  }
 
   async function api(path, options = {}) {
     const controller = new AbortController();
@@ -142,7 +182,7 @@
   function scheduleText(operator) {
     const schedule = operator.schedule || {};
     const scheduledDays = schedule.every_days ? `Каждые ${schedule.every_days} дня` : Array.isArray(schedule.days) ? schedule.days.map((day) => days[String(day).toLowerCase()] || String(day)).join(' и ') : 'Расписание не задано';
-    return `${scheduledDays}${schedule.time ? ` · ${schedule.time}` : ''} · МСК`;
+    return `${scheduledDays}${schedule.time ? ` · ${schedule.time}` : ''} · МСК${schedule.month_boundary === 'close_previous_month' ? ' · с закрытием месяца' : ''}`;
   }
 
   function operatorCard(operator) {
@@ -171,7 +211,7 @@
       if (!runs.length) return emptyState(emptyTitle, emptyDescription);
       return `<table class="runs-table"><thead><tr><th>ОПЕРАТОР</th><th>ПЕРИОД</th><th>СТАТУС</th><th class="run-time-column">ЗАПУСК</th><th></th></tr></thead><tbody>${runs.map((run) => {
         const zip = zipFile(run);
-        return `<tr><td><span class="run-name">${escape(operatorName(run.operator_id))}</span><span class="run-sub">${escape(({ scheduled: 'По расписанию', schedule: 'По расписанию', manual: 'Ручной запуск', import: 'Импорт файлов' })[run.trigger] || 'Запуск оператора')}</span></td><td><span class="run-period">${escape(runPeriodLabel(run))}</span></td><td>${statusBadge(run)}</td><td class="run-time-column"><span class="run-period">${escape(formatDate(run.created_at))}</span><span class="run-sub">${escape(formatTime(run.created_at))} МСК</span></td><td class="run-action-cell"><div class="table-actions">${zip ? `<a class="run-download" href="${escape(safeFileUrl(zip.url))}" download>${svg('download')}${successStatuses.has(runStatus(run)) ? 'Скачать ZIP' : runStatus(run) === 'no_data' ? 'Исходники ZIP' : 'ZIP проверки'}</a>` : ''}<button class="icon-button" type="button" data-run-details="${escape(run.id)}" aria-label="Открыть запуск за ${escape(runPeriodLabel(run))}">${svg('arrow-up-right')}</button></div></td></tr>`;
+        return `<tr><td><span class="run-name">${escape(operatorName(run.operator_id))}</span><span class="run-sub">${escape(({ scheduled: 'По расписанию', schedule: 'По расписанию', manual: 'Ручной запуск', import: 'Импорт файлов' })[run.trigger] || 'Запуск оператора')}</span></td><td><span class="run-period">${escape(runPeriodLabel(run))}</span><span class="run-sub">Актирование ${escape(formatDate(run.run_date, { year: 'numeric' }))}</span></td><td>${statusBadge(run)}</td><td class="run-time-column"><span class="run-period">${escape(formatDate(run.created_at))}</span><span class="run-sub">${escape(formatTime(run.created_at))} МСК</span></td><td class="run-action-cell"><div class="table-actions">${zip ? `<a class="run-download" href="${escape(safeFileUrl(zip.url))}" download>${svg('download')}${successStatuses.has(runStatus(run)) ? 'Скачать ZIP' : runStatus(run) === 'no_data' ? 'Исходники ZIP' : 'ZIP проверки'}</a>` : ''}<button class="icon-button" type="button" data-run-details="${escape(run.id)}" aria-label="Открыть запуск за ${escape(runPeriodLabel(run))}">${svg('arrow-up-right')}</button></div></td></tr>`;
       }).join('')}</tbody></table>`;
     }
     $('recent-runs').innerHTML = table(state.runs.slice(0, 4), 'Первый отчёт скоро будет здесь', 'Подключите GloPro и запустите расчёт или импортируйте уже скачанные выгрузки.');
@@ -180,7 +220,7 @@
     const filtered = state.runs.filter((run) => {
       const status = runStatus(run);
       const matchesStatus = filter === 'all' || filter === 'success' && successStatuses.has(status) || filter === 'active' && activeStatuses.has(status) || filter === 'attention' && attentionStatuses.has(status);
-      const searchable = `${operatorName(run.operator_id)} ${run.id} ${run.period_start} ${run.period_end} ${runPeriodLabel(run)}`.toLocaleLowerCase('ru-RU');
+      const searchable = `${operatorName(run.operator_id)} ${run.id} ${run.run_date} ${run.period_start} ${run.period_end} ${runPeriodLabel(run)}`.toLocaleLowerCase('ru-RU');
       return matchesStatus && (!query || searchable.includes(query));
     });
     $('all-runs').innerHTML = table(filtered, state.runs.length ? 'Нет подходящих запусков' : 'История пока пуста', state.runs.length ? 'Попробуйте изменить строку поиска или статус.' : 'Завершённые расчёты и их исходные файлы будут сохранены здесь.');
@@ -207,9 +247,7 @@
       $('next-run-time').textContent = formatTime(next.next_run);
       $('next-run-date').textContent = formatDate(next.next_run, { weekday: 'long', day: 'numeric', month: 'long' });
       $('next-run-name').textContent = next.name || next.id;
-      const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(next.next_run));
-      const period = periodForDate(localDate, next.kind);
-      $('next-run-period').textContent = period ? `За ${periodLabel(period.start, period.end)}` : scheduleText(next);
+      $('next-run-period').textContent = next.next_plan ? planText(next.next_plan, next.kind, true) : scheduleText(next);
     } else {
       const operator = state.operators[0];
       $('next-run-time').textContent = '—:—';
@@ -237,6 +275,7 @@
       const operator = state.operators.find((item) => item.id === button.dataset.runOperator);
       button.disabled = busy || Boolean(operator?.kind && !['glopro', 'yandex', 'seo'].includes(operator.kind));
     });
+    updatePlanButtons();
   }
 
   async function refreshState() {
@@ -322,28 +361,14 @@
     $('run-operator').innerHTML = state.operators.filter((operator) => !operator.kind || ['glopro', 'yandex', 'seo'].includes(operator.kind)).map((operator) => `<option value="${escape(operator.id)}">${escape(operator.name || operator.id)}</option>`).join('');
     if (!$('run-operator').options.length) return toast('Нет оператора с доступным обработчиком.', true);
     if (operatorId) $('run-operator').value = operatorId;
-    $('run-date').value = scheduledDate(selectedKind('run-operator'));
+    $('run-date').value = scheduledDate($('run-operator').value);
     $('run-form-error').hidden = true;
     updatePeriodPreview();
     $('run-dialog').showModal();
   }
 
   function updatePeriodPreview() {
-    const kind = selectedKind('run-operator');
-    if (kind === 'seo') { $('run-period-preview').textContent = 'Одна новая статья в актуальном четырёхдневном выпуске. Новая обложка и статья сохраняются в CMS. Повтор использует тот же текст и изображение.'; return; }
-    const period = periodForDate($('run-date').value, kind);
-    if (!period) {
-      $('run-period-preview').textContent = kind === 'yandex' ? 'Выберите вторник: отчёт за предыдущие вторник–понедельник.' : 'Выберите вторник или пятницу. Отчёт охватит дни перед выбранной датой.';
-      return;
-    }
-    if (kind === 'yandex') { $('run-period-preview').textContent = `Яндекс: ${periodLabel(period.start, period.end)}, полные сутки по Москве. Все сотрудники с заправками будут определены по заказам недели.`; return; }
-    const planned = new Date(`${$('run-date').value}T00:00:00Z`);
-    let weekly = 'Китай и НК АРТЭЛЬ в пятницу пропускаются.';
-    if (planned.getUTCDay() === 2) {
-      planned.setUTCDate(planned.getUTCDate() - 7);
-      weekly = `Китай и НК АРТЭЛЬ: ${periodLabel(planned.toISOString().slice(0, 10), period.end)}.`;
-    }
-    $('run-period-preview').textContent = `Обычные фирмы: ${periodLabel(period.start, period.end)}. ${weekly} Все даты по Москве, сутки целиком.`;
+    requestPeriodPreview('run');
   }
 
   function showFormError(id, message) { $(id).textContent = message; $(id).hidden = false; }
@@ -368,9 +393,11 @@
     const companyPeriods = Array.isArray(run.company_periods) ? run.company_periods.filter((item) => Array.isArray(item.period) && item.period.length === 2 && (item.period[0] !== run.period_start || item.period[1] !== run.period_end)) : [];
     $('run-details').innerHTML = `
       <div class="detail-meta">${statusBadge(run)}<span>Создан ${escape(formatDate(run.created_at, { year: 'numeric' }))} в ${escape(formatTime(run.created_at))} МСК</span>${run.finished_at ? `<span>Завершён ${escape(formatTime(run.finished_at))} МСК</span>` : ''}</div>
+      <p class="field-hint">Плановая дата актирования: ${escape(formatDate(run.run_date, { year: 'numeric' }))}.</p>
+      ${run.plan ? `<p class="field-hint">${escape(planText(run.plan, runKind))}</p>` : ''}
       <p class="field-hint">${escape(trigger)} · ${runKind === 'seo' ? 'Источников' : 'Исходных файлов'}: ${count(run.source_count)} · ${unit}: ${count(runKind === 'seo' ? run.article_count : run.client_count)}</p>
       ${excludedClients.length ? `<p class="field-hint">Временно пропущены: ${escape(excludedClients.join(', '))}.</p>` : ''}
-      ${scheduleSkipped.length ? `<p class="field-hint">Только во вторник: ${escape(scheduleSkipped.join(', '))}. В этом запуске пропущены.</p>` : ''}
+      ${scheduleSkipped.length ? `<p class="field-hint">Пропущены по расписанию: ${escape(scheduleSkipped.join(', '))}.</p>` : ''}
       ${emptyClients.length ? `<p class="field-hint">Без заправок — XLSX не скачивались (${emptyClients.length}): ${escape(emptyClients.join(', '))}.</p>` : ''}
       ${companyPeriods.map((item) => `<p class="field-hint">${escape(item.client)}: ${escape(periodLabel(item.period[0], item.period[1]))}, полные сутки по Москве.</p>`).join('')}
       ${run.error ? `<div class="inline-message error">${escape(typeof run.error === 'string' ? run.error : JSON.stringify(run.error))}</div>` : ''}
@@ -391,9 +418,7 @@
   hydrateIcons();
   function selectedKind(id) { return state.operators.find(o => o.id === $(id).value)?.kind || 'glopro'; }
   function updateImportPeriod() {
-    const kind = selectedKind('import-operator');
-    const period = periodForDate($('import-date').value, kind);
-    $('import-period-preview').textContent = period ? periodLabel(period.start, period.end) : (kind === 'yandex' ? 'Выберите вторник.' : 'Выберите вторник или пятницу.');
+    requestPeriodPreview('import');
   }
   function renderYandex() {
     const value = state.yandex || {};
@@ -412,9 +437,9 @@
       await refreshState();
     } catch(error) { toast(error.message, true); $('yandex-connect').disabled = false; }
   });
-  $('run-operator').addEventListener('change', () => { $('run-date').value = scheduledDate(selectedKind('run-operator')); updatePeriodPreview(); });
-  $('import-operator').addEventListener('change', () => { $('import-date').value = scheduledDate(selectedKind('import-operator')); updateImportPeriod(); });
-  $('import-date').addEventListener('change', updateImportPeriod);
+  $('run-operator').addEventListener('change', () => { $('run-date').value = scheduledDate($('run-operator').value); updatePeriodPreview(); });
+  $('import-operator').addEventListener('change', () => { $('import-date').value = scheduledDate($('import-operator').value); updateImportPeriod(); });
+  $('import-date').addEventListener('input', updateImportPeriod);
   $('today').textContent = formatDate(new Date().toISOString(), { day: 'numeric', month: 'long', year: 'numeric' });
   navigate(window.location.hash.slice(1) || 'overview');
   window.addEventListener('hashchange', () => navigate(window.location.hash.slice(1)));
@@ -422,7 +447,7 @@
   $('retry-state').addEventListener('click', refreshState);
   $('run-search').addEventListener('input', renderRuns);
   $('run-filter').addEventListener('change', renderRuns);
-  $('run-date').addEventListener('change', updatePeriodPreview);
+  $('run-date').addEventListener('input', updatePeriodPreview);
 
   document.addEventListener('click', (event) => {
     if (event.target.closest('.skip-link')) {
@@ -444,7 +469,7 @@
       if (isActive()) return toast('Дождитесь завершения текущего запуска.', true);
       $('import-operator').innerHTML = state.operators.filter(o => ['glopro', 'yandex'].includes(o.kind)).map(o => `<option value="${escape(o.id)}">${escape(o.name)}</option>`).join('');
       if (button.dataset.importOperator) $('import-operator').value = button.dataset.importOperator;
-      $('import-date').value = scheduledDate(selectedKind('import-operator'));
+      $('import-date').value = scheduledDate($('import-operator').value);
       updateImportPeriod();
       $('import-form-error').hidden = true;
       $('import-dialog').showModal();
@@ -501,7 +526,7 @@
   $('run-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     if (isActive()) return showFormError('run-form-error', 'Дождитесь завершения текущего запуска.');
-    if (!periodForDate($('run-date').value, selectedKind('run-operator'))) return showFormError('run-form-error', 'Для Яндекса выберите вторник, для GloPro — вторник или пятницу.');
+    if (!validPreview('run')) return showFormError('run-form-error', 'Выберите доступную дату и дождитесь проверки периода.');
     const button = $('run-submit');
     button.disabled = true;
     state.pending = true;
@@ -514,7 +539,7 @@
       window.location.hash = 'runs';
       await refreshState();
     } catch (error) { showFormError('run-form-error', error.message); }
-    finally { state.pending = false; button.disabled = false; updateRunButtons(); }
+    finally { state.pending = false; updateRunButtons(); }
   });
 
   const fileInput = $('import-files');
@@ -526,7 +551,7 @@
   $('import-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     if (isActive()) return showFormError('import-form-error', 'Дождитесь завершения текущего запуска.');
-    if (!periodForDate($('import-date').value, selectedKind('import-operator'))) return showFormError('import-form-error', 'Для Яндекса выберите вторник, для GloPro — вторник или пятницу.');
+    if (!validPreview('import')) return showFormError('import-form-error', 'Выберите доступную дату и дождитесь проверки периода.');
     if (!fileInput.files.length) return showFormError('import-form-error', 'Добавьте хотя бы один файл Excel.');
     if (Array.from(fileInput.files).some((file) => !/\.xlsx$/i.test(file.name))) return showFormError('import-form-error', 'Можно загрузить только файлы .xlsx.');
     if (fileInput.files.length > 200) return showFormError('import-form-error', 'Можно загрузить не больше 200 файлов за один раз.');
@@ -548,7 +573,7 @@
       window.location.hash = 'runs';
       await refreshState();
     } catch (error) { showFormError('import-form-error', error.message); }
-    finally { state.pending = false; $('import-submit').disabled = false; updateRunButtons(); }
+    finally { state.pending = false; updateRunButtons(); }
   });
 
   $('connection-form').addEventListener('submit', async (event) => {
