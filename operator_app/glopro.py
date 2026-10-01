@@ -541,20 +541,31 @@ class GloProConnector:
             raise GloProError("GloPro не принял даты отчётного периода.")
 
     def _check_activity(self, page, contract, first, last):
-        response = None
-        try:
-            response = page.context.request.post(ORIGIN + "/clients/contract-transactions", form={"contract_id": contract["id"], "offset": "0"},
-                                                 headers={"X-Requested-With": "XMLHttpRequest"}, timeout=20_000, max_redirects=0)
-            if response.status != 200:
-                raise GloProError("GloPro не подтвердил проверку операций за период")
-            return activity_from_recent(response.json(), first, last)
-        except GloProError:
-            raise
-        except Exception:
-            raise GloProError("Не удалось проверить операции GloPro до скачивания отчёта") from None
-        finally:
-            if response is not None:
-                response.dispose()
+        # This POST only reads recent operations. Report generation is never
+        # retried here. A transient read failure must not become an empty period.
+        for attempt in range(3):
+            response = None
+            try:
+                response = page.context.request.post(ORIGIN + "/clients/contract-transactions", form={"contract_id": contract["id"], "offset": "0"},
+                                                     headers={"X-Requested-With": "XMLHttpRequest"}, timeout=20_000, max_redirects=0)
+                if response.status == 429 or response.status >= 500:
+                    if attempt == 2:
+                        raise GloProError("GloPro временно не отвечает при проверке операций (3 попытки)")
+                elif response.status != 200:
+                    raise GloProError(f"GloPro не подтвердил проверку операций (HTTP {response.status})")
+                else:
+                    return activity_from_recent(response.json(), first, last)
+            except GloProError:
+                raise
+            except Exception as error:
+                transient = type(error).__name__ == "TimeoutError" or "net::ERR_" in str(error)
+                if not transient or attempt == 2:
+                    reason = "таймаут/сбой сети после 3 попыток" if transient else "неподтверждённый ответ"
+                    raise GloProError(f"Не удалось проверить операции GloPro: {reason}") from None
+            finally:
+                if response is not None:
+                    response.dispose()
+            page.wait_for_timeout(700 * (attempt + 1))
 
     def _prepare_report(self, page, client: dict, contract: dict, first: date, last: date):
         selector = page.locator('select[name="contracts_list"]')

@@ -161,8 +161,12 @@ def _client_record_period(record, client, client_id=None):
     return date.fromisoformat(record["period_start"]), date.fromisoformat(record["period_end"])
 
 
-def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edition_key=None):
+def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edition_key=None, period_start=None, period_end=None):
     conf = get_operator(ident)
+    custom_period = period_start is not None or period_end is not None
+    if custom_period and (conf["kind"] != "yandex" or trigger != "manual" or not run_date
+                          or period_start is None or period_end is None):
+        raise ValueError("Произвольный период: нужен ручной запуск Яндекса, дата актирования и обе границы")
     if edition_key is not None and (conf["kind"] != "seo" or trigger != "manual" or run_date is not None
                                     or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", edition_key)):
         raise ValueError("Внеплановый выпуск: нужен SEO-оператор и постоянный edition_key без run_date")
@@ -190,8 +194,8 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edi
         plan = plan_run(conf, scheduled_date)
         start, end = date.fromisoformat(plan["period_start"]), date.fromisoformat(plan["period_end"])
     elif conf["kind"] == "yandex":
-        from .yandex_reports import period_for as yandex_period
-        start, end = yandex_period(scheduled_date)
+        from .yandex_reports import period_for as yandex_period, record_period
+        start, end = record_period(dict(run_date=str(scheduled_date), period_start=period_start, period_end=period_end)) if custom_period else yandex_period(scheduled_date)
     elif conf["kind"] == "seo":
         start = end = scheduled_date
     else:
@@ -412,9 +416,9 @@ PROCESSORS["glopro"] = process_glopro
 
 
 def process_yandex(conf, record, sources, root, progress, *, imported):
-    from .yandex_reports import read_report, write_outputs, label_reports, render_yandex_report, plain_report, period_for as yandex_period
+    from .yandex_reports import read_report, write_outputs, label_reports, render_yandex_report, plain_report, record_period
     from .yandex_publication import save_yandex_sections, merge_yandex_sections
-    start, end = yandex_period(date.fromisoformat(record["run_date"]))
+    start, end = record_period(record)
     aliases = conf.get("employee_aliases", conf.get("employees", []))
     manifests = [e["manifest"] for e in record["events"] if e.get("stage") == "discovered" and "manifest" in e]
     manifest = manifests[0] if len(manifests) == 1 else None
@@ -457,7 +461,7 @@ def process_yandex(conf, record, sources, root, progress, *, imported):
                "company_periods": [{"client": r["name"], "user_id": r["user_id"], "period": r["period"]} for r in reports]}
     audit = {"reports": reports, "errors": failures, "empty_clients": empty, "imported": imported,
              "cabinet_manifest": manifest,
-             "coverage": "imported_files_only" if imported else "all_week_orders",
+             "coverage": "imported_files_only" if imported else "all_period_orders",
              "litre_reconciliation": "cabinet litres rounded per row to XLSX precision 0.01, HALF_UP"}
     if failures:
         return ProcessResult("needs_review", error="Отчёты Яндекса не прошли проверку; итог не опубликован.", metrics=metrics, audit=audit)

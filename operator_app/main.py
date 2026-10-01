@@ -85,6 +85,8 @@ class RunBody(BaseModel):
     operator_id: str = "glopro"
     run_date: str | None = None
     edition_key: str | None = None
+    period_start: str | None = None
+    period_end: str | None = None
 
 
 class ConnectionBody(BaseModel):
@@ -181,7 +183,8 @@ def create_operator(body: NewOperator):
 
 @app.post("/api/run", status_code=202)
 def run(body: RunBody):
-    return engine.submit(body.operator_id, body.run_date, edition_key=body.edition_key)
+    return engine.submit(body.operator_id, body.run_date, edition_key=body.edition_key,
+                         period_start=body.period_start, period_end=body.period_end)
 
 
 @app.post("/api/import", status_code=202)

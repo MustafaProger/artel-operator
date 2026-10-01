@@ -166,6 +166,7 @@ def fake_download_environment(monkeypatch, tmp_path, statuses):
         raise AssertionError(path)
     cabinet = SimpleNamespace(request=request)
     browser = MagicMock()
+    browser.context.new_page.return_value = browser
     clock = [0]
     browser.wait_for_timeout.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms/1000)
     monkeypatch.setattr(yandex.time, 'monotonic', lambda: clock[0])

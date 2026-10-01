@@ -1,11 +1,10 @@
 """Yandex corporate fuel exports through the same verified cabinet UI."""
-from datetime import date
 import time
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from . import storage, yandex_connection
 from .network import browser_proxy
-from .yandex_reports import read_report, period_for
+from .yandex_reports import read_report, record_period
 from .yandex_cabinet import Cabinet, CabinetError, collect_orders, discover_employees, API, REPORTS, ID
 
 
@@ -78,18 +77,36 @@ def download_employee(cabinet, page, directory, employee, start, end, company, a
         if time.monotonic() >= deadline:
             raise YandexError("Яндекс не завершил создание нового отчёта")
         page.wait_for_timeout(1500)
-    # Use the cabinet's own download link; signed URLs and auth stay out of logs.
-    page.reload(wait_until="domcontentloaded", timeout=60000)
-    verify_page(page, company)
-    open_reports(page)
-    option = page.locator(f'[id$="-option-{identity}"]')
-    option.wait_for(timeout=60000)
     temporary = directory / f".{employee['user_id']}.xlsx"
     destination = directory / f"Яндекс. {employee['label']}.xlsx"
     try:
-        with page.expect_download(timeout=90000) as event:
-            option.get_by_role("button", name="Скачать", exact=True).press("Enter")
-        event.value.save_as(temporary)
+        # Reloading or downloading is safe to retry for the same confirmed task.
+        # Never create a second report or select a different history entry here.
+        for attempt in range(2):
+            download_page = page.context.new_page()
+            try:
+                progress({"stage": "checking", "report_id": identity,
+                          "message": "Отчёт готов; открываем его в списке для скачивания"})
+                # A fresh tab rebuilds the cabinet's report menu. Reusing its
+                # existing tab can leave the list stale even after reload.
+                download_page.goto(yandex_connection.URL, wait_until="domcontentloaded", timeout=60000)
+                verify_page(download_page, company)
+                open_reports(download_page)
+                option = download_page.locator(f'[id$="-option-{identity}"]')
+                option.wait_for(timeout=60000)
+                progress({"stage": "checking", "report_id": identity,
+                          "message": "Скачиваем готовый Excel по подтверждённому ID"})
+                with download_page.expect_download(timeout=90000) as event:
+                    option.get_by_role("button", name="Скачать", exact=True).press("Enter")
+                event.value.save_as(temporary)
+                break
+            except PlaywrightTimeout:
+                if attempt == 1:
+                    raise
+                progress({"stage": "checking", "report_id": identity,
+                          "message": "Кабинет не ответил; повторяем скачивание того же отчёта"})
+            finally:
+                download_page.close()
         report = read_report(temporary, start, end, company, aliases=aliases,
                              expected_orders=employee["orders"])
         if report["user_id"] != employee["user_id"] or not report["active"]:
@@ -113,7 +130,7 @@ def download_employee(cabinet, page, directory, employee, start, end, company, a
 
 
 def download_reports(conf, record, directory, progress):
-    start, end = period_for(date.fromisoformat(record["run_date"]))
+    start, end = record_period(record)
     if not yandex_connection.session_path().is_file():
         raise YandexError("Подключите кабинет Яндекса на странице «Подключения»")
     aliases = conf.get("employee_aliases", conf.get("employees", []))

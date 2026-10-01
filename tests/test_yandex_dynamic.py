@@ -233,6 +233,7 @@ def test_rejected_download_preserves_original_without_publishing(tmp_path, monke
         dict(task_id=identity), dict(task_id=identity, status='complete'),
     ]
     page = MagicMock()
+    page.context.new_page.return_value = page
     page.expect_download.return_value.__enter__.return_value.value.save_as.side_effect = source
     monkeypatch.setattr(yandex, 'verify_page', Mock())
     monkeypatch.setattr(yandex, 'open_reports', Mock())

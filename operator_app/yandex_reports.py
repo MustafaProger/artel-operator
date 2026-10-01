@@ -23,6 +23,17 @@ def period_for(run_date):
     return run_date - timedelta(days=7), run_date - timedelta(days=1)
 
 
+def record_period(record):
+    """Use the persisted range for an explicitly requested manual report."""
+    if "period_start" not in record and "period_end" not in record:
+        return period_for(date.fromisoformat(record["run_date"]))
+    start = date.fromisoformat(record["period_start"])
+    end = date.fromisoformat(record["period_end"])
+    if start > end or end >= date.fromisoformat(record["run_date"]):
+        raise ValueError("Период Яндекса должен быть завершён до даты актирования")
+    return start, end
+
+
 def text(value):
     return " ".join(str(value or "").split())
 
