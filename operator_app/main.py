@@ -31,17 +31,27 @@ async def scheduler():
         await asyncio.sleep(15)
 
 
+def scheduler_enabled():
+    value = os.environ.get("OPERATOR_SCHEDULER_ENABLED", "true").lower()
+    if value not in {"true", "false"}:
+        raise ValueError("OPERATOR_SCHEDULER_ENABLED: используйте true или false")
+    return value == "true"
+
+
 @asynccontextmanager
 async def lifespan(app):
     storage.init()
     OPERATORS.mkdir(parents=True, exist_ok=True)
-    task = asyncio.create_task(scheduler())
-    yield
-    task.cancel()
+    task = asyncio.create_task(scheduler()) if scheduler_enabled() else None
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Артель · Оператор", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -84,6 +94,7 @@ class NewOperator(MarkdownBody):
 class RunBody(BaseModel):
     operator_id: str = "glopro"
     run_date: str | None = None
+    report_month: str | None = None
     edition_key: str | None = None
     period_start: str | None = None
     period_end: str | None = None
@@ -115,7 +126,7 @@ def state():
     operators = []
     now = datetime.now(timezone.utc)
     for conf in load_operators():
-        planned = engine.next_scheduled_run(conf, now) if conf["kind"] == "glopro" else next_run(conf, now)
+        planned = engine.next_scheduled_run(conf, now) if conf["kind"] in {"glopro", "yandex"} else next_run(conf, now)
         if conf["kind"] == "seo":
             from .seo import next_due
             due = next_due(conf)
@@ -133,7 +144,10 @@ def state():
     return {"operators": operators, "runs": storage.runs(), "server_time": storage.now_iso(),
             "yandex": yandex_connection.status(),
             "connection": {"configured": bool(storage.credentials()), "verified": storage.setting("connection_verified", False)},
-            "scheduler_error": storage.setting("scheduler_error"), "runtime": "Локальное приложение. Для расписания процесс должен работать."}
+            "scheduler_error": storage.setting("scheduler_error"),
+            "scheduler_enabled": scheduler_enabled(),
+            "runtime": ("Расписание включено; процесс должен работать." if scheduler_enabled()
+                        else "Расписание выключено. Доступен ручной запуск.")}
 
 
 @app.post("/api/yandex/connect")
@@ -151,6 +165,11 @@ def preview_plan(ident: str, run_date: str):
     return operator_plan(get_operator(ident), date.fromisoformat(run_date))
 
 
+@app.get("/api/operators/{ident}/monthly-plan")
+def preview_monthly_plan(ident: str, month: str):
+    return engine.monthly_plan(get_operator(ident), month, now=datetime.now(timezone.utc))
+
+
 def write_operator(ident, markdown):
     conf = parse_operator(markdown, ident)
     existing = OPERATORS / f"{ident}.md"
@@ -163,7 +182,7 @@ def write_operator(ident, markdown):
     if not conf["enabled"]:
         storage.set_setting(f"enabled_since:{ident}", None)
     now = datetime.now(timezone.utc)
-    planned = engine.next_scheduled_run(conf, now) if conf["kind"] == "glopro" else next_run(conf, now)
+    planned = engine.next_scheduled_run(conf, now) if conf["kind"] in {"glopro", "yandex"} else next_run(conf, now)
     return {"ok": True, "next_run": planned}
 
 
@@ -184,7 +203,8 @@ def create_operator(body: NewOperator):
 @app.post("/api/run", status_code=202)
 def run(body: RunBody):
     return engine.submit(body.operator_id, body.run_date, edition_key=body.edition_key,
-                         period_start=body.period_start, period_end=body.period_end)
+                         period_start=body.period_start, period_end=body.period_end,
+                         report_month=body.report_month)
 
 
 @app.post("/api/import", status_code=202)

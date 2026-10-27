@@ -84,6 +84,32 @@ def _run_scope(conf):
     return {"clients": conf.get("clients", []), "excluded_clients": conf.get("excluded_clients", [])}
 
 
+def _is_monthly(record):
+    return (record.get("plan") or {}).get("kind") == "monthly_summary"
+
+
+def monthly_plan(conf, month, now=None):
+    """A separate reporting period; it never replaces an activation slot."""
+    if conf["kind"] != "glopro":
+        raise ValueError("Месячный отчёт доступен только для GloPro")
+    if not isinstance(month, str) or not re.fullmatch(r"\d{4}-\d{2}", month):
+        raise ValueError("Укажите месяц в формате YYYY-MM")
+    try:
+        first = date.fromisoformat(month + "-01")
+        following = date(first.year + (first.month == 12), first.month % 12 + 1, 1)
+    except ValueError:
+        raise ValueError("Укажите корректный календарный месяц") from None
+    last = following - timedelta(days=1)
+    zone = ZoneInfo(conf["schedule"]["timezone"])
+    today = (now or datetime.now(zone)).astimezone(zone).date()
+    period = [first.isoformat(), last.isoformat()]
+    return {"kind": "monthly_summary", "month": month, "run_date": following.isoformat(),
+            "period_start": period[0], "period_end": period[1],
+            "ordinary_period": period.copy(), "weekly_period": period.copy(),
+            "calendar_periods": {"ordinary": period.copy(), "weekly": period.copy()},
+            "all_clients": True, "can_run": following <= today, "future": following > today}
+
+
 def _legacy_plan(conf, day, record):
     # Old runs can have a wide top-level period for a special-client-only
     # recovery. It is not the ordinary firms' accounting boundary.
@@ -105,9 +131,17 @@ def plan_run(conf, day):
     """One stable plan for preview, enqueue and retries; history is read-only."""
     if conf["kind"] != "glopro":
         return run_plan(conf, day)
-    history = storage.operator_runs(conf["id"], day - timedelta(days=10), day + timedelta(days=10))
+    history = [item for item in storage.operator_runs(conf["id"], day - timedelta(days=10), day + timedelta(days=10))
+               if not _is_monthly(item)]
     same_day = [item for item in history if item["run_date"] == day.isoformat()]
     saved = next((item for item in same_day if item.get("plan")), None)
+    if saved and conf["schedule"].get("month_close_all_from") and not saved["plan"].get("month_close_all_from"):
+        # Explicit policy migration: preserve the old record/artifacts and use
+        # a newly previewed plan for a new attempt, never mutate old history.
+        fresh = run_plan(conf, day)
+        if fresh.get("month_close_all_from"):
+            fresh["supersedes_calendar_run"] = saved["id"]
+            return fresh
     if saved:
         if saved.get("scope") != _run_scope(conf):
             return plan_for_clients(saved["plan"], conf)
@@ -131,7 +165,13 @@ def _schedule_satisfied(conf, day):
     # Imports or old/manual subset recoveries do not prove full coverage.
     # Only a successful download with the same captured client scope can
     # replace the automatic attempt for this exact logical date.
-    return any(item["trigger"] == "manual" and item["status"] in {"completed", "no_data"}
+    if conf["kind"] == "yandex":
+        plan = run_plan(conf, day)
+        return any(item["trigger"] == "manual" and item["status"] in {"completed", "no_data"}
+                   and [item["period_start"], item["period_end"]] == [plan["period_start"], plan["period_end"]]
+                   and any(event.get("activity_check_complete") for event in item.get("events", []))
+                   for item in storage.operator_runs(conf["id"], day, day))
+    return any(not _is_monthly(item) and item["trigger"] == "manual" and item["status"] in {"completed", "no_data"}
                and item.get("plan") and item.get("scope") == _run_scope(conf)
                for item in storage.operator_runs(conf["id"], day, day))
 
@@ -139,7 +179,7 @@ def _schedule_satisfied(conf, day):
 def next_scheduled_run(conf, now=None):
     """Upcoming calendar slot that the scheduler will still attempt."""
     candidate = next_run(conf, now)
-    while candidate and conf["kind"] == "glopro":
+    while candidate and conf["kind"] in {"glopro", "yandex"}:
         when = datetime.fromisoformat(candidate)
         attempted = any(item["trigger"] == "schedule"
                         for item in storage.operator_runs(conf["id"], when.date(), when.date()))
@@ -161,8 +201,12 @@ def _client_record_period(record, client, client_id=None):
     return date.fromisoformat(record["period_start"]), date.fromisoformat(record["period_end"])
 
 
-def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edition_key=None, period_start=None, period_end=None):
+def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edition_key=None, period_start=None, period_end=None, report_month=None):
     conf = get_operator(ident)
+    monthly = report_month is not None
+    if monthly and (conf["kind"] != "glopro" or trigger != "manual" or uploads is not None
+                    or run_date is not None or edition_key is not None or period_start is not None or period_end is not None):
+        raise ValueError("Месячный отчёт: нужен ручной запуск GloPro с месяцем, без даты актирования, импорта и произвольного периода")
     custom_period = period_start is not None or period_end is not None
     if custom_period and (conf["kind"] != "yandex" or trigger != "manual" or not run_date
                           or period_start is None or period_end is None):
@@ -172,7 +216,11 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edi
         raise ValueError("Внеплановый выпуск: нужен SEO-оператор и постоянный edition_key без run_date")
     if conf["kind"] not in HANDLERS or conf["kind"] not in PROCESSORS:
         raise ValueError("Для этого оператора ещё не подключены получение и обработка результатов")
-    scheduled_date = date.fromisoformat(run_date) if run_date else latest_run_date(conf=conf)
+    monthly_snapshot = monthly_plan(conf, report_month) if monthly else None
+    if monthly_snapshot and not monthly_snapshot["can_run"]:
+        raise ValueError("Выберите завершённый календарный месяц")
+    scheduled_date = (date.fromisoformat(monthly_snapshot["run_date"]) if monthly else
+                      date.fromisoformat(run_date) if run_date else latest_run_date(conf=conf))
     if conf["kind"] == "seo":
         if uploads is not None:
             raise ValueError("SEO: импорт XLSX не поддерживается")
@@ -184,22 +232,32 @@ def submit(ident="glopro", run_date=None, trigger="manual", uploads=None, *, edi
         due = seo_next_due({**conf, "enabled": True})
         if edition_key is None and not seo_edition(conf["id"], str(scheduled_date)) and due and due.date() > today:
             raise ValueError("SEO: предыдущая статья уже опубликована; следующий выпуск " + due.date().isoformat())
-    if not run_date and conf["kind"] == "yandex":
+    if not run_date and conf["kind"] == "yandex" and not conf["schedule"].get("month_close_all_from"):
         while scheduled_date.weekday() != 1:
             scheduled_date -= timedelta(days=1)
     if scheduled_date > datetime.now(ZoneInfo(conf["schedule"]["timezone"])).date():
         raise ValueError("Нельзя рассчитывать ещё не завершившийся период")
     plan = None
     if conf["kind"] == "glopro":
-        plan = plan_run(conf, scheduled_date)
+        plan = monthly_snapshot if monthly else plan_run(conf, scheduled_date)
         start, end = date.fromisoformat(plan["period_start"]), date.fromisoformat(plan["period_end"])
     elif conf["kind"] == "yandex":
         from .yandex_reports import period_for as yandex_period, record_period
-        start, end = record_period(dict(run_date=str(scheduled_date), period_start=period_start, period_end=period_end)) if custom_period else yandex_period(scheduled_date)
+        if custom_period:
+            start, end = record_period(dict(run_date=str(scheduled_date), period_start=period_start, period_end=period_end))
+            if conf["schedule"].get("month_close_all_from") and (start.year, start.month) != (end.year, end.month):
+                raise ValueError("Разные месяцы нужно выгружать отдельными отчётами")
+        else:
+            if not conf["schedule"].get("month_close_all_from"):
+                yandex_period(scheduled_date)  # Preserve legacy validation.
+            plan = run_plan(conf, scheduled_date)
+            start, end = map(date.fromisoformat, (plan["period_start"], plan["period_end"]))
     elif conf["kind"] == "seo":
         start = end = scheduled_date
     else:
         start, end = period_for(scheduled_date)
+    if monthly or (plan and plan.get("month_close_all_from") and plan["kind"] == "month_close"):
+        conf = {**conf, "clients": [], "excluded_clients": []}
     with SUBMIT_LOCK:
         record = storage.create_run(ident, scheduled_date, start, end, trigger,
                                     require_idle=True, edition_key=edition_key,
@@ -288,12 +346,57 @@ def _publish_note(destination, report, writer):
     writer(destination, report)
 
 
+def _monthly_coverage(record, sources):
+    """Require a result for every discovered contract, including verified zeroes."""
+    events = record.get("events", [])
+    manifests = [event["clients"] for event in events if event.get("stage") == "clients" and "clients" in event]
+    if len(manifests) != 1 or not manifests[0] or not any(event.get("activity_check_complete") for event in events):
+        raise ValueError("Не подтверждён полный список фирм и завершение месячной выгрузки")
+    clients = deepcopy(manifests[0])
+    ids = [str(client.get("id", "")) for client in clients]
+    if not all(ids) or len(ids) != len(set(ids)):
+        raise ValueError("Неоднозначный список фирм месячной выгрузки")
+    expected = set()
+    for client in clients:
+        ident = str(client["id"])
+        lists = [event.get("contract_ids", []) for event in events
+                 if event.get("stage") == "contracts" and str(event.get("client_id")) == ident]
+        if len(lists) != 1 or not lists[0]:
+            raise ValueError(f"Не подтверждены договоры фирмы {client['name']}; полный месячный отчёт не выпущен")
+        contracts = list(map(str, lists[0]))
+        if not all(contracts) or len(contracts) != len(set(contracts)):
+            raise ValueError("Неоднозначный список договоров месячной выгрузки")
+        client["contract_ids"] = contracts
+        expected.update((ident, contract) for contract in contracts)
+    period = [record["period_start"], record["period_end"]]
+    actual = []
+    for source in sources:
+        if [source.get("start"), source.get("end")] != period:
+            raise ValueError("Период одного из исходников не совпадает с полным месяцем")
+        actual.append((str(source.get("client_id", "")), str(source.get("contract_id", ""))))
+    for event in events:
+        if event.get("reason") == "no_operations":
+            if event.get("period") != period or event.get("evidence", {}).get("has_operations") is not False:
+                raise ValueError("Отсутствие операций за полный месяц не подтверждено")
+            actual.append((str(event.get("client_id", "")), str(event.get("contract_id", ""))))
+        elif event.get("stage") == "skipped":
+            raise ValueError("В месячном отчёте нельзя пропускать фирмы по настройкам или расписанию")
+    if len(actual) != len(set(actual)) or set(actual) != expected:
+        raise ValueError("Месячная выгрузка неполная или содержит повтор договора; итоговый отчёт не выпущен")
+    return clients
+
+
 def process_glopro(conf, record, sources, root, progress, *, imported=False):
     """Calculate GloPro sources and write its domain-specific result files."""
     result = ProcessResult(status="failed")
     reports, failures = [], []
     excluded = {}
     schedule_skipped = {}
+    monthly = _is_monthly(record)
+    monthly_clients = _monthly_coverage(record, sources) if monthly else []
+    calculation_rules = {**conf.get("rules", {})}
+    if monthly:
+        calculation_rules["report_month"] = record["plan"]["month"]
 
     def remember_schedule_skip(client):
         name = client.get("client") or client.get("name") or ""
@@ -328,9 +431,11 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
                 progress(dict(stage="skipped", reason=reason, client=client,
                               client_id=source.get("client_id", ""), message=f"В этот запуск по календарю не входит: {client}"))
                 continue
-            rules = {**conf.get("rules", {}), "supplier": conf.get("supplier", "Новое имя"),
+            rules = {**calculation_rules, "supplier": conf.get("supplier", "Новое имя"),
                      "date_from": period[0], "date_to": period[1], "run_date": record["run_date"],
                      "client": client, "client_id": source.get("client_id")}
+            if record.get("plan", {}).get("month_close_all_from"):
+                rules["month_close_all_from"] = record["plan"]["month_close_all_from"]
             report = calculate_workbook(source["path"], rules)
             source["client"] = report["client"]
             report["period"] = [period[0].isoformat(), period[1].isoformat()]
@@ -362,8 +467,10 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
         if imported or None in client_ids or len(client_ids) != 1 or any(c is None for c in contracts) or len(contracts) != len(set(contracts)):
             raise ValueError("Повтор фирмы в исходных файлах: нельзя складывать пересекающиеся выгрузки")
         try:
-            merged = merge_reports(group, conf.get("rules", {}))
+            merged = merge_reports(group, calculation_rules)
             merged["period"] = group[0]["period"]
+            if monthly:
+                merged["client_id"] = group[0]["client_id"]
             reports.append(merged)
         except ValueError as exc:
             failures.append({"file": group[0]["client"], "error": str(exc)})
@@ -385,8 +492,15 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
         raise ValueError("Повтор фирмы в исходных файлах: нельзя складывать пересекающиеся выгрузки")
     if failures:
         result.status = "needs_review"
-        result.error = f"Нужна проверка {len(failures)} из {len(sources)} файлов. Итоговая активация не выпущена."
+        result.error = f"Нужна проверка {len(failures)} из {len(sources)} файлов. " + ("Месячный отчёт не выпущен." if monthly else "Итоговая активация не выпущена.")
         (root / "Ошибки проверки.json").write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif monthly:
+        from .monthly import write_monthly_outputs
+        output = write_monthly_outputs(reports, record, root, calculation_rules,
+                                       empty_clients=result.metrics["empty_clients"], clients=monthly_clients)
+        result.report = output["report"]
+        result.metrics.update(output["metrics"])
+        result.status = "completed" if any(r["status"] == "ready" for r in reports) else "no_data"
     elif not any(report.get("status") == "ready" or report.get("weekly_kind") for report in reports):
         result.status = "no_data"
         result.error = ("Все переданные фирмы временно исключены из расчёта." if excluded and not reports else
@@ -409,6 +523,10 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
                     "empty_clients": result.metrics["empty_clients"],
                     "excluded_clients": list(excluded.values()), "schedule_skipped_clients": list(schedule_skipped.values()),
                     "company_periods": company_periods}
+    if monthly:
+        result.audit["coverage"] = monthly_clients
+        if not failures:
+            result.audit.update(output["audit"])
     return result
 
 
@@ -650,7 +768,7 @@ def tick(now=None):
             scheduled = datetime.combine(day, time.fromisoformat(conf["schedule"]["time"]), zone)
             if not schedule_matches(conf, day) or scheduled > local or scheduled < since:
                 continue
-            if conf["kind"] == "glopro" and _schedule_satisfied(conf, day):
+            if conf["kind"] in {"glopro", "yandex"} and _schedule_satisfied(conf, day):
                 continue
             try:
                 submit(conf["id"], day.isoformat(), trigger="schedule")

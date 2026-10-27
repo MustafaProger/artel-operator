@@ -46,10 +46,36 @@ def test_special_clients_use_supplier_basis_for_customer_markup(tmp_path, client
     assert report["fuels"][0]["supplier_price"] == "77.58"
 
 
-def test_mixed_types_refused_instead_of_averaged(tmp_path):
-    path = workbook(tmp_path, [tx(discount=-1), tx(discount=-2)])
-    with pytest.raises(CalculationError, match="смешаны"):
-        calculate_workbook(path)
+def test_mixed_types_apply_each_multiplier_before_weighting(tmp_path):
+    path = workbook(tmp_path, [tx(discount=-1), tx("ДТ", 50, 4500, 4700, -2),
+                               tx(litres=-20, supplier=-1600, customer=-1660)])
+    report = calculate_workbook(path)
+    assert report["card_type"] == "mixed"
+    assert report["fuels"][0]["supplier_price"] == "83.53"  # (6400 * .99 + 4500 * 1.005) / 130
+    assert report["totals"] == {"litres": "130.000", "supplier_basis": "10900.00", "customer_total": "11340.00"}
+    assert report["audit"]["raw_fuels"][0]["supplier_basis_by_card_type"] == {"virtual": "6400", "plastic": "4500"}
+
+
+@pytest.mark.parametrize("rules,match", [({}, "не определён"), ({"card_type": "plastic"}, "противоречит")])
+def test_mixed_cards_preserve_unknown_and_forced_type_checks(tmp_path, rules, match):
+    rows = [tx(discount=-1), tx(discount=-2)]
+    if not rules:
+        rows.append(tx(discount=-5))
+    with pytest.raises(CalculationError, match=match):
+        calculate_workbook(workbook(tmp_path, rows), rules)
+
+
+def test_mixed_special_client_keeps_virtual_exception(tmp_path):
+    report = calculate_workbook(workbook(tmp_path, [tx(discount=-1, client="ПЕРФЕКТ"), tx(discount=-2, client="ПЕРФЕКТ")]))
+    assert report["card_type"] == "virtual"
+    assert report["fuels"][0]["supplier_price"] == "79.20"
+    assert report["totals"]["customer_total"] == "16320.00"
+
+
+def test_mixed_zero_litres_cannot_hide_adjusted_supplier_balance(tmp_path):
+    rows = [tx(), tx(litres=-100, supplier=-8000, customer=-8300, discount=-2)]
+    with pytest.raises(CalculationError, match="литраж равен нулю"):
+        calculate_workbook(workbook(tmp_path, rows))
 
 
 def test_headers_are_named_not_fixed_position_and_summaries_not_counted(tmp_path):
@@ -245,11 +271,26 @@ def test_merge_ignores_no_data_card_type_but_preserves_ready_peer(tmp_path):
     assert merged["totals"]["litres"] == "100.000"
 
 
-def test_merge_mixed_card_types_rejected(tmp_path):
+def test_merge_mixed_card_types_and_nested_reports(tmp_path):
     first = calculate_workbook(workbook(tmp_path, [tx(discount=-1)]))
-    second = calculate_workbook(workbook(tmp_path, [tx(discount=-2)]))
-    with pytest.raises(CalculationError, match="смешаны"):
-        merge_reports([first, second])
+    second = calculate_workbook(workbook(tmp_path, [tx(litres=50, supplier=4500, customer=4700, discount=-2)]))
+    merged = merge_reports([first, second])
+    assert merged["card_type"] == "mixed"
+    assert merged["fuels"][0]["supplier_price"] == "82.95"
+    third = calculate_workbook(workbook(tmp_path, [tx(litres=-20, supplier=-1600, customer=-1660)]))
+    nested = merge_reports([merged, third])
+    assert nested["fuels"][0]["supplier_price"] == "83.53"
+    assert nested["totals"]["customer_total"] == "11340.00"
+
+
+def test_merge_mixed_requires_intact_card_breakdown(tmp_path):
+    report = calculate_workbook(workbook(tmp_path, [tx(discount=-1), tx(discount=-2)]))
+    report["audit"]["raw_fuels"][0]["supplier_basis_by_card_type"]["virtual"] = "1"
+    with pytest.raises(CalculationError, match="не совпадает"):
+        merge_reports([report])
+    del report["audit"]["raw_fuels"][0]["supplier_basis_by_card_type"]
+    with pytest.raises(CalculationError, match="Нет разбивки"):
+        merge_reports([report])
 
 
 @pytest.mark.parametrize("change", ["client", "supplier"])

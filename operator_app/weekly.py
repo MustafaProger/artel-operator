@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from .calculator import (
     CalculationError, _columns, _date, _decimal, _fuel, _litres, _money,
-    _norm, _ru, company_identity,
+    _norm, _ru, _validate_rules, company_identity,
 )
 
 AMOUNTS = ("litres", "supplier_basis", "customer_total")
@@ -30,15 +30,24 @@ def _add(target, amounts):
 
 def _period(rows, settings):
     first, last = settings.get("date_from"), settings.get("date_to")
-    if settings.get("run_date"):
+    if settings.get("report_month"):
+        monthly = _validate_rules(settings)
+        first, last = monthly["date_from"], monthly["date_to"]
+    elif settings.get("run_date"):
         run_date = _date(settings["run_date"], "плановая дата")
-        if run_date.weekday() != 1:
-            raise CalculationError("Эта фирма обрабатывается только во вторничном запуске")
-        expected = (run_date - timedelta(days=7), run_date - timedelta(days=1))
+        if settings.get("month_close_all_from") and run_date >= _date(settings["month_close_all_from"], "начало календаря"):
+            from .config import monthly_weekly_period
+            if run_date.weekday() != 1 and run_date.day != 1:
+                raise CalculationError("Эта фирма обрабатывается во вторник или при закрытии месяца")
+            expected = monthly_weekly_period(run_date)
+        else:
+            if run_date.weekday() != 1:
+                raise CalculationError("Эта фирма обрабатывается только во вторничном запуске")
+            expected = (run_date - timedelta(days=7), run_date - timedelta(days=1))
         if (first and first != expected[0]) or (last and last != expected[1]):
             raise CalculationError("Запрошенный период не соответствует плановому вторнику")
         first, last = expected
-    if not first or not last or first.weekday() != 1 or last - first != timedelta(days=6):
+    if not first or not last or (not settings.get("report_month") and not settings.get("month_close_all_from") and (first.weekday() != 1 or last - first != timedelta(days=6))):
         raise CalculationError("Нужен недельный период со вторника по понедельник")
     expected = (datetime.combine(first, time.min, MOSCOW), datetime.combine(last, time(23, 59, 59), MOSCOW))
     periods = []
@@ -57,7 +66,7 @@ def _period(rows, settings):
             raise CalculationError("Некорректный период внутри Excel") from None
         periods.append((start, end))
     if not periods:
-        raise CalculationError("В Excel отсутствует период отчёта; даты операций не подтверждают полноту недели")
+        raise CalculationError("В Excel отсутствует период отчёта; даты операций не подтверждают полноту периода")
     if any(period != expected for period in periods):
         raise CalculationError(f"Период внутри Excel не совпадает с {first:%d.%m.%Y}–{last:%d.%m.%Y} (Europe/Moscow)")
     return expected
@@ -85,6 +94,7 @@ def _transaction_time(value, row):
 
 def calculate_weekly(rows, header_index, columns, client, kind, settings):
     first, last = _period(rows, settings)
+    monthly = bool(settings.get("report_month"))
     totals, cards, groups = _zero(), {}, {}
     checks, transaction_rows, summary_rows, dates = [], [], [], []
     current_card, current_holder = None, None
@@ -122,9 +132,13 @@ def calculate_weekly(rows, header_index, columns, client, kind, settings):
             if summary:
                 summary_rows.append(index)
                 if re.match(r"^(итого по отчету|всего по отчету|общий итог по отчету)(?:\s|:|$)", summary):
+                    if monthly and service_name is not None:
+                        raise CalculationError("Отсутствует итог услуги для сверки")
                     check(row, index, totals, "файла")
                     file_checked = True
                 elif summary.startswith("итого по карте"):
+                    if monthly and service_name is not None:
+                        raise CalculationError("Отсутствует итог услуги для сверки")
                     if not current_card or cards[current_card]["checked"]:
                         raise CalculationError(f"Строка {index}: итог карты без однозначной карты")
                     check(row, index, cards[current_card]["totals"], "карты " + current_card)
@@ -159,6 +173,8 @@ def calculate_weekly(rows, header_index, columns, client, kind, settings):
                 elif "держатель" in metadata:
                     current_holder = metadata["держатель"]
                 if "услуга" in metadata:
+                    if monthly and service_name is not None:
+                        raise CalculationError("Отсутствует итог предыдущей услуги для сверки")
                     service_name, service_totals = metadata["услуга"], _zero()
                 continue
             if any(_norm(v) in {"нет данных", "нет операций", "операции отсутствуют", "данные отсутствуют"} for v in labels):
@@ -175,6 +191,8 @@ def calculate_weekly(rows, header_index, columns, client, kind, settings):
         if cell("operation") and _norm(cell("operation")) not in {"дебет", "возврат"}:
             raise CalculationError(f"Строка {index}: неизвестный тип операции")
         fuel = _fuel(cell("service"), index)
+        if monthly and (service_name is None or _fuel(service_name, index) != fuel):
+            raise CalculationError(f"Строка {index}: услуга операции не соответствует блоку сверки")
         amounts = {key: _decimal(cell(key), f"{key}, строка {index}") for key in AMOUNTS}
         if any(amounts["litres"] * amounts[key] < 0 for key in AMOUNTS[1:]):
             raise CalculationError(f"Строка {index}: знаки литража и сумм не совпадают")

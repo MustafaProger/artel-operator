@@ -107,6 +107,8 @@ textarea#markdown-editor:focus-visible { outline: 2px solid var(--accent); }
 .settings-panel > .field-hint:last-child { margin-top: 25px; padding-top: 19px; border-top: 1px solid var(--line); }
 .field-label { display: block; margin: 22px 0 9px; color: var(--ink); font-size: 12px; font-weight: 550; }
 .field-label:first-child { margin-top: 0; }
+#run-mode-field, #run-date-field, #run-month-field { margin-top: 22px; }
+.monthly-totals { padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: #fafcfb; font-weight: 600; line-height: 1.7; }
 .field-hint { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
 .integration-layout { margin-top: 24px; }
 .integration-layout > .instruction-help { grid-column: 1; padding: 26px 30px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--accent-soft); }

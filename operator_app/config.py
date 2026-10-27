@@ -87,6 +87,35 @@ def parse_operator(markdown: str, expected_id: str | None = None) -> dict:
         schedule["month_boundary_from"] = active_from
     elif "month_boundary_from" in schedule:
         raise ValueError("schedule.month_boundary_from требует schedule.month_boundary")
+    if "month_close_all_from" in schedule:
+        try:
+            value = str(schedule["month_close_all_from"])
+            date.fromisoformat(value)
+            if conf["kind"] not in {"glopro", "yandex"}:
+                raise ValueError()
+            if conf["kind"] == "glopro" and schedule.get("month_boundary") != "close_previous_month":
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError("schedule.month_close_all_from: нужна дата и календарь закрытия топлива") from None
+        schedule["month_close_all_from"] = value
+    if "period_overrides" in schedule:
+        overrides = schedule["period_overrides"]
+        if conf["kind"] != "yandex" or not isinstance(overrides, dict):
+            raise ValueError("schedule.period_overrides: допустимы только периоды Яндекса по датам актирования")
+        normalized = {}
+        for run_day, period in overrides.items():
+            try:
+                day = date.fromisoformat(str(run_day))
+                if not isinstance(period, list) or len(period) != 2:
+                    raise ValueError()
+                start, end = (date.fromisoformat(str(value)) for value in period)
+                if (day.weekday() != 1 or start > end or end != day - timedelta(days=1)
+                        or (start.year, start.month) != (end.year, end.month)):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise ValueError("Исключение Яндекса: дата вторника и завершённый период одного месяца до предыдущего понедельника") from None
+            normalized[day.isoformat()] = [start.isoformat(), end.isoformat()]
+        schedule["period_overrides"] = normalized
     if conf["kind"] == "yandex":
         if schedule["days"] != ["tue"] or schedule["timezone"] != "Europe/Moscow":
             raise ValueError("Яндекс: только вторник, часовой пояс Europe/Moscow")
@@ -233,6 +262,24 @@ def _raw_schedule_matches(conf: dict, day: date) -> bool:
     return day.weekday() in [DAYS[d] for d in conf["schedule"]["days"]]
 
 
+def all_month_close(conf: dict, day: date) -> bool:
+    active = conf["schedule"].get("month_close_all_from")
+    return bool(active and day >= date.fromisoformat(active))
+
+
+def monthly_weekly_period(day: date) -> tuple[date, date]:
+    """A closure consumes only the remaining days since the last Tuesday.
+
+    Subsequent Tuesdays consume the current month only. These intervals are
+    contiguous even when the first is Tuesday or the month ends on Monday.
+    """
+    if day.day == 1:
+        start = day - timedelta(days=(day.weekday() - 1) % 7 or 7)
+    else:
+        start = max(day - timedelta(days=7), day.replace(day=1))
+    return start, day - timedelta(days=1)
+
+
 def _plan_for(conf: dict, day: date) -> dict | None:
     ordinary = weekly = None
     moved_from = None
@@ -255,13 +302,23 @@ def _plan_for(conf: dict, day: date) -> dict | None:
             ordinary = period_for(day)
         if day.weekday() == 1 and _raw_schedule_matches(conf, day):
             weekly = (day - timedelta(days=7), day - timedelta(days=1))
+        if all_month_close(conf, day) and (day.day == 1 or weekly is not None):
+            weekly = monthly_weekly_period(day)
         if ordinary is None and weekly is not None:
             kind = "weekly_only"
         primary = ordinary or weekly
     elif conf["kind"] == "yandex":
-        if not _raw_schedule_matches(conf, day):
+        closing = all_month_close(conf, day) and day.day == 1
+        if not closing and not _raw_schedule_matches(conf, day):
             return None
-        weekly = primary = (day - timedelta(days=7), day - timedelta(days=1))
+        weekly = primary = (monthly_weekly_period(day) if all_month_close(conf, day)
+                            else (day - timedelta(days=7), day - timedelta(days=1)))
+        if closing:
+            kind = "month_close"
+        override = conf["schedule"].get("period_overrides", {}).get(day.isoformat())
+        if override:
+            weekly = primary = tuple(date.fromisoformat(value) for value in override)
+            kind = "period_override"
     elif conf["kind"] == "seo":
         if not _raw_schedule_matches(conf, day):
             return None
@@ -277,6 +334,8 @@ def _plan_for(conf: dict, day: date) -> dict | None:
         "weekly_period": [value.isoformat() for value in weekly] if weekly else None,
         "kind": kind, "moved_from": moved_from,
     }
+    if all_month_close(conf, day):
+        result["month_close_all_from"] = conf["schedule"]["month_close_all_from"]
     if conf["kind"] == "glopro":
         # Save calendar eligibility before applying client selection. A later
         # retry can add a client without recomputing the calendar under a new
@@ -313,9 +372,10 @@ def plan_for_clients(plan: dict, conf: dict) -> dict:
     }
     ordinary = calendar.get("ordinary")
     weekly = calendar.get("weekly")
-    if calendar.get("filter_ordinary") and not _has_ordinary_clients(conf):
+    close_all = bool(result.get("month_close_all_from") and calendar.get("kind") == "month_close")
+    if not close_all and calendar.get("filter_ordinary") and not _has_ordinary_clients(conf):
         ordinary = None
-    if not _has_weekly_clients(conf):
+    if not close_all and not _has_weekly_clients(conf):
         weekly = None
     primary = ordinary or weekly
     if not primary:
@@ -328,7 +388,7 @@ def plan_for_clients(plan: dict, conf: dict) -> dict:
     result.pop("ordinary_moved_to", None)
     result.pop("explanation", None)
     if result["kind"] == "month_close":
-        result["explanation"] = "Закрытие предыдущего месяца; операции с 1-го числа войдут в следующий обычный отчёт."
+        result["explanation"] = "Закрытие предыдущего месяца; операции с 1-го числа войдут в следующий отчёт."
     elif result["kind"] == "weekly_only":
         result["explanation"] = "Только Китай и НК АРТЭЛЬ за предыдущие вторник–понедельник."
         if _has_ordinary_clients(conf) and calendar.get("ordinary_moved_to"):
@@ -371,7 +431,7 @@ def next_run(conf: dict, now: datetime | None = None) -> str | None:
 
 
 def schedule_matches(conf: dict, day: date) -> bool:
-    if _month_policy(conf):
+    if _month_policy(conf) or all_month_close(conf, day):
         return _plan_for(conf, day) is not None
     return _raw_schedule_matches(conf, day)
 

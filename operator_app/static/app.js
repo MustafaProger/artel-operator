@@ -60,6 +60,18 @@
     return state.operators.find((operator) => operator.id === operatorId)?.latest_plan?.run_date || '';
   }
 
+  function previousMonth() {
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Moscow', year: 'numeric', month: '2-digit' }).formatToParts(new Date(state.serverTime || Date.now()));
+    const year = Number(parts.find((part) => part.type === 'year').value);
+    const month = Number(parts.find((part) => part.type === 'month').value);
+    return `${month === 1 ? year - 1 : year}-${String(month === 1 ? 12 : month - 1).padStart(2, '0')}`;
+  }
+
+  const isMonthlyRun = (run) => run.plan?.kind === 'monthly_summary';
+  const monthlySelected = () => selectedKind('run-operator') === 'glopro' && $('run-mode').value === 'monthly';
+  const monthLabel = (month) => formatDate(`${month}-01`, { day: undefined, month: 'long', year: 'numeric' });
+  const reportNumber = (value, digits) => value !== null && value !== undefined && String(value).trim() !== '' && Number.isFinite(Number(value))
+    ? new Intl.NumberFormat('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(Number(value)) : '—';
   const periodLabel = (start, end) => `${formatDate(start)} — ${formatDate(end, { year: 'numeric' })}`;
   const runPeriodLabel = (run) => Array.isArray(run.output_period) && run.output_period.length === 2 ? periodLabel(...run.output_period) : periodLabel(run.period_start, run.period_end);
   const operatorName = (id) => state.operators.find((operator) => operator.id === id)?.name || id || 'Оператор';
@@ -69,8 +81,9 @@
   function planText(plan, kind, compact = false) {
     if (!plan) return 'Период пока не определён.';
     if (plan.error) return plan.error;
+    if (plan.kind === 'monthly_summary') return `Месячный отчёт: ${periodLabel(plan.period_start, plan.period_end)}. Все фирмы, включая Китай и НК АРТЭЛЬ.${compact ? '' : ' Итоги: литры и сумма к оплате нам с учётом наценок и скидок из инструкции. Полные сутки по Москве.'}`;
     if (kind === 'seo') return compact ? `Выпуск ${formatDate(plan.run_date, { year: 'numeric' })}` : 'Одна новая статья в актуальном четырёхдневном выпуске. Новая обложка и статья сохраняются в CMS. Повтор использует тот же текст и изображение.';
-    if (kind === 'yandex') return `Яндекс: ${periodLabel(plan.period_start, plan.period_end)}${compact ? '.' : ', полные сутки по Москве. Все сотрудники с заправками будут определены по заказам недели.'}`;
+    if (kind === 'yandex') return `Яндекс: ${periodLabel(plan.period_start, plan.period_end)}${compact ? '.' : ', полные сутки по Москве. Все сотрудники с заправками будут определены по заказам периода.'}`;
     const parts = [];
     if (plan.kind === 'month_close') parts.push('Закрытие месяца.');
     if (plan.kind === 'weekly_only') parts.push('Только недельные фирмы. Обычные фирмы в этот день пропускаются.');
@@ -85,6 +98,7 @@
   }
 
   function previewKey(prefix) {
+    if (prefix === 'run' && monthlySelected()) return `${$('run-operator').value}:monthly:${$('run-month').value}`;
     return `${$(`${prefix}-operator`).value}:${$(`${prefix}-date`).value}`;
   }
 
@@ -105,17 +119,19 @@
     preview.plan = null;
     preview.loading = true;
     const operatorId = $(`${prefix}-operator`).value;
-    const day = $(`${prefix}-date`).value;
+    const monthly = prefix === 'run' && monthlySelected();
+    const day = monthly ? $('run-month').value : $(`${prefix}-date`).value;
     const label = $(`${prefix}-period-preview`);
-    label.textContent = day && operatorId ? 'Проверяем дату и период…' : 'Выберите дату планового актирования.';
+    label.textContent = day && operatorId ? 'Проверяем дату и период…' : monthly ? 'Выберите завершённый месяц.' : 'Выберите дату планового актирования.';
     updatePlanButtons();
     if (!day || !operatorId) { preview.loading = false; return; }
     preview.timer = window.setTimeout(async () => {
       try {
-        const plan = await api(`/api/operators/${encodeURIComponent(operatorId)}/plan?run_date=${encodeURIComponent(day)}`, { timeout: 15000 });
+        const endpoint = monthly ? `monthly-plan?month=${encodeURIComponent(day)}` : `plan?run_date=${encodeURIComponent(day)}`;
+        const plan = await api(`/api/operators/${encodeURIComponent(operatorId)}/${endpoint}`, { timeout: 15000 });
         if (request !== preview.request || preview.key !== previewKey(prefix)) return;
         preview.plan = plan;
-        label.textContent = planText(plan, selectedKind(`${prefix}-operator`)) + (plan.future ? ' Это будущая дата; запуск станет доступен в день актирования.' : '');
+        label.textContent = planText(plan, selectedKind(`${prefix}-operator`)) + (plan.future ? monthly ? ' Месяц ещё не завершён; выберите предыдущий месяц.' : ' Это будущая дата; запуск станет доступен в день актирования.' : '');
       } catch (error) {
         if (request !== preview.request || preview.key !== previewKey(prefix)) return;
         label.textContent = error.message;
@@ -182,7 +198,7 @@
   function scheduleText(operator) {
     const schedule = operator.schedule || {};
     const scheduledDays = schedule.every_days ? `Каждые ${schedule.every_days} дня` : Array.isArray(schedule.days) ? schedule.days.map((day) => days[String(day).toLowerCase()] || String(day)).join(' и ') : 'Расписание не задано';
-    return `${scheduledDays}${schedule.time ? ` · ${schedule.time}` : ''} · МСК${schedule.month_boundary === 'close_previous_month' ? ' · с закрытием месяца' : ''}`;
+    return `${scheduledDays}${schedule.time ? ` · ${schedule.time}` : ''} · МСК${(schedule.month_boundary === 'close_previous_month' || schedule.month_close_all_from) ? ' · с закрытием месяца' : ''}`;
   }
 
   function operatorCard(operator) {
@@ -211,7 +227,7 @@
       if (!runs.length) return emptyState(emptyTitle, emptyDescription);
       return `<table class="runs-table"><thead><tr><th>ОПЕРАТОР</th><th>ПЕРИОД</th><th>СТАТУС</th><th class="run-time-column">ЗАПУСК</th><th></th></tr></thead><tbody>${runs.map((run) => {
         const zip = zipFile(run);
-        return `<tr><td><span class="run-name">${escape(operatorName(run.operator_id))}</span><span class="run-sub">${escape(({ scheduled: 'По расписанию', schedule: 'По расписанию', manual: 'Ручной запуск', import: 'Импорт файлов' })[run.trigger] || 'Запуск оператора')}</span></td><td><span class="run-period">${escape(runPeriodLabel(run))}</span><span class="run-sub">Актирование ${escape(formatDate(run.run_date, { year: 'numeric' }))}</span></td><td>${statusBadge(run)}</td><td class="run-time-column"><span class="run-period">${escape(formatDate(run.created_at))}</span><span class="run-sub">${escape(formatTime(run.created_at))} МСК</span></td><td class="run-action-cell"><div class="table-actions">${zip ? `<a class="run-download" href="${escape(safeFileUrl(zip.url))}" download>${svg('download')}${successStatuses.has(runStatus(run)) ? 'Скачать ZIP' : runStatus(run) === 'no_data' ? 'Исходники ZIP' : 'ZIP проверки'}</a>` : ''}<button class="icon-button" type="button" data-run-details="${escape(run.id)}" aria-label="Открыть запуск за ${escape(runPeriodLabel(run))}">${svg('arrow-up-right')}</button></div></td></tr>`;
+        return `<tr><td><span class="run-name">${escape(operatorName(run.operator_id))}</span><span class="run-sub">${escape(isMonthlyRun(run) ? 'Месячный отчёт · все фирмы' : ({ scheduled: 'По расписанию', schedule: 'По расписанию', manual: 'Ручной запуск', import: 'Импорт файлов' })[run.trigger] || 'Запуск оператора')}</span></td><td><span class="run-period">${escape(runPeriodLabel(run))}</span><span class="run-sub">${isMonthlyRun(run) ? escape(monthLabel(run.plan.month)) : `Актирование ${escape(formatDate(run.run_date, { year: 'numeric' }))}`}</span></td><td>${statusBadge(run)}</td><td class="run-time-column"><span class="run-period">${escape(formatDate(run.created_at))}</span><span class="run-sub">${escape(formatTime(run.created_at))} МСК</span></td><td class="run-action-cell"><div class="table-actions">${zip ? `<a class="run-download" href="${escape(safeFileUrl(zip.url))}" download>${svg('download')}${successStatuses.has(runStatus(run)) ? 'Скачать ZIP' : runStatus(run) === 'no_data' ? 'Исходники ZIP' : 'ZIP проверки'}</a>` : ''}<button class="icon-button" type="button" data-run-details="${escape(run.id)}" aria-label="Открыть запуск за ${escape(runPeriodLabel(run))}">${svg('arrow-up-right')}</button></div></td></tr>`;
       }).join('')}</tbody></table>`;
     }
     $('recent-runs').innerHTML = table(state.runs.slice(0, 4), 'Первый отчёт скоро будет здесь', 'Подключите GloPro и запустите расчёт или импортируйте уже скачанные выгрузки.');
@@ -220,7 +236,7 @@
     const filtered = state.runs.filter((run) => {
       const status = runStatus(run);
       const matchesStatus = filter === 'all' || filter === 'success' && successStatuses.has(status) || filter === 'active' && activeStatuses.has(status) || filter === 'attention' && attentionStatuses.has(status);
-      const searchable = `${operatorName(run.operator_id)} ${run.id} ${run.run_date} ${run.period_start} ${run.period_end} ${runPeriodLabel(run)}`.toLocaleLowerCase('ru-RU');
+      const searchable = `${operatorName(run.operator_id)} ${run.id} ${run.run_date} ${run.period_start} ${run.period_end} ${runPeriodLabel(run)} ${isMonthlyRun(run) ? `месячный отчёт ${run.plan.month} ${monthLabel(run.plan.month)}` : ''}`.toLocaleLowerCase('ru-RU');
       return matchesStatus && (!query || searchable.includes(query));
     });
     $('all-runs').innerHTML = table(filtered, state.runs.length ? 'Нет подходящих запусков' : 'История пока пуста', state.runs.length ? 'Попробуйте изменить строку поиска или статус.' : 'Завершённые расчёты и их исходные файлы будут сохранены здесь.');
@@ -287,6 +303,7 @@
       state.runs = (Array.isArray(payload.runs) ? payload.runs : []).slice().sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
       state.connection = payload.connection || {};
       state.yandex = payload.yandex || {};
+      state.serverTime = payload.server_time;
       state.loaded = true;
       const signature = JSON.stringify([state.operators, state.runs, state.connection, state.yandex]);
       if (signature !== state.lastStateSignature) {
@@ -356,15 +373,34 @@
     }
   }
 
-  function openManualRun(operatorId) {
+  function openManualRun(operatorId, reportMonth = null) {
     if (isActive()) return toast('Уже есть выполняющийся запуск. Дождитесь результата.', true);
     $('run-operator').innerHTML = state.operators.filter((operator) => !operator.kind || ['glopro', 'yandex', 'seo'].includes(operator.kind)).map((operator) => `<option value="${escape(operator.id)}">${escape(operator.name || operator.id)}</option>`).join('');
     if (!$('run-operator').options.length) return toast('Нет оператора с доступным обработчиком.', true);
     if (operatorId) $('run-operator').value = operatorId;
     $('run-date').value = scheduledDate($('run-operator').value);
+    $('run-mode').value = reportMonth ? 'monthly' : 'scheduled';
+    $('run-month').max = previousMonth();
+    $('run-month').value = reportMonth || previousMonth();
+    $('run-form-error').hidden = true;
+    updateRunMode();
+    $('run-dialog').showModal();
+  }
+
+  function updateRunMode() {
+    const supported = selectedKind('run-operator') === 'glopro';
+    if (!supported) $('run-mode').value = 'scheduled';
+    const monthly = monthlySelected();
+    $('run-mode-field').hidden = !supported;
+    $('run-mode').disabled = !supported;
+    $('run-date-field').hidden = monthly;
+    $('run-date').disabled = monthly;
+    $('run-date').required = !monthly;
+    $('run-month-field').hidden = !monthly;
+    $('run-month').disabled = !monthly;
+    $('run-month').required = monthly;
     $('run-form-error').hidden = true;
     updatePeriodPreview();
-    $('run-dialog').showModal();
   }
 
   function updatePeriodPreview() {
@@ -377,7 +413,7 @@
     const run = state.runs.find((item) => String(item.id) === String(id));
     if (!run) return;
     state.detailId = id;
-    $('details-title').textContent = `${operatorName(run.operator_id)} · ${runPeriodLabel(run)}`;
+    $('details-title').textContent = `${isMonthlyRun(run) ? 'Месячный отчёт · ' : ''}${operatorName(run.operator_id)} · ${runPeriodLabel(run)}`;
     const files = fileList(run).filter((file) => safeFileUrl(file.url));
     const report = typeof run.report === 'string' ? run.report : run.report ? JSON.stringify(run.report, null, 2) : '';
     const trigger = ({ scheduled: 'По расписанию', schedule: 'По расписанию', manual: 'Ручной запуск', import: 'Ручной импорт Excel' })[run.trigger] || run.trigger || 'Не указан';
@@ -393,8 +429,9 @@
     const companyPeriods = Array.isArray(run.company_periods) ? run.company_periods.filter((item) => Array.isArray(item.period) && item.period.length === 2 && (item.period[0] !== run.period_start || item.period[1] !== run.period_end)) : [];
     $('run-details').innerHTML = `
       <div class="detail-meta">${statusBadge(run)}<span>Создан ${escape(formatDate(run.created_at, { year: 'numeric' }))} в ${escape(formatTime(run.created_at))} МСК</span>${run.finished_at ? `<span>Завершён ${escape(formatTime(run.finished_at))} МСК</span>` : ''}</div>
-      <p class="field-hint">Плановая дата актирования: ${escape(formatDate(run.run_date, { year: 'numeric' }))}.</p>
+      ${isMonthlyRun(run) ? `<p class="field-hint">Полный месяц: ${escape(monthLabel(run.plan.month))}. Все фирмы.</p>` : `<p class="field-hint">Плановая дата актирования: ${escape(formatDate(run.run_date, { year: 'numeric' }))}.</p>`}
       ${run.plan ? `<p class="field-hint">${escape(planText(run.plan, runKind))}</p>` : ''}
+      ${isMonthlyRun(run) && successStatuses.has(runStatus(run)) && run.total_litres != null && run.total_customer_amount != null ? `<p class="monthly-totals">Всего ${escape(reportNumber(run.total_litres, 3))} л · К оплате нам ${escape(reportNumber(run.total_customer_amount, 2))} ₽</p>` : ''}
       <p class="field-hint">${escape(trigger)} · ${runKind === 'seo' ? 'Источников' : 'Исходных файлов'}: ${count(run.source_count)} · ${unit}: ${count(runKind === 'seo' ? run.article_count : run.client_count)}</p>
       ${excludedClients.length ? `<p class="field-hint">Временно пропущены: ${escape(excludedClients.join(', '))}.</p>` : ''}
       ${scheduleSkipped.length ? `<p class="field-hint">Пропущены по расписанию: ${escape(scheduleSkipped.join(', '))}.</p>` : ''}
@@ -408,7 +445,8 @@
       ${failures.length ? `<h3 class="detail-section-title">Файлы, требующие проверки · ${failures.length}</h3>${failures.map((failure) => `<div class="inline-message error"><strong>${escape(failure.file || 'Исходный файл')}</strong><br>${escape(failure.error || 'Не прошёл проверку')}</div>`).join('')}` : ''}
       <h3 class="detail-section-title">Файлы запуска · ${files.length}</h3>
       ${files.length ? `<div class="detail-file-list">${files.map((file) => `<a class="detail-file" href="${escape(safeFileUrl(file.url))}" download>${svg(/\.zip$/i.test(file.name) ? 'folder' : 'document')}<span>${escape(file.name)}</span>${svg('download')}</a>`).join('')}</div>` : `<p class="field-hint">${running ? 'Файлы появятся после завершения обработки.' : 'В этом запуске нет файлов для скачивания.'}</p>`}
-      ${report ? `<h3 class="detail-section-title">Отчёт</h3><pre class="detail-report">${escape(report)}</pre>` : ''}`;
+      ${report ? `<h3 class="detail-section-title">Отчёт</h3><pre class="detail-report">${escape(report)}</pre>` : ''}
+      ${isMonthlyRun(run) && !running ? `<div class="modal-actions"><button class="button button-secondary" type="button" data-repeat-monthly="${escape(run.id)}" ${isActive() ? 'disabled' : ''}>Повторить месячный отчёт</button></div>` : ''}`;
   }
 
   function newOperatorTemplate() {
@@ -437,7 +475,9 @@
       await refreshState();
     } catch(error) { toast(error.message, true); $('yandex-connect').disabled = false; }
   });
-  $('run-operator').addEventListener('change', () => { $('run-date').value = scheduledDate($('run-operator').value); updatePeriodPreview(); });
+  $('run-operator').addEventListener('change', () => { $('run-date').value = scheduledDate($('run-operator').value); updateRunMode(); });
+  $('run-mode').addEventListener('change', updateRunMode);
+  $('run-month').addEventListener('input', updatePeriodPreview);
   $('import-operator').addEventListener('change', () => { $('import-date').value = scheduledDate($('import-operator').value); updateImportPeriod(); });
   $('import-date').addEventListener('input', updateImportPeriod);
   $('today').textContent = formatDate(new Date().toISOString(), { day: 'numeric', month: 'long', year: 'numeric' });
@@ -475,6 +515,10 @@
       $('import-dialog').showModal();
     }
     if (button.dataset.runOperator) openManualRun(button.dataset.runOperator);
+    if (button.dataset.repeatMonthly) {
+      const run = state.runs.find((item) => item.id === button.dataset.repeatMonthly);
+      if (run && isMonthlyRun(run)) { $('details-dialog').close(); openManualRun(run.operator_id, run.plan.month); }
+    }
     if (button.dataset.editOperator) {
       if (state.editorDirty && state.editorId !== button.dataset.editOperator && !window.confirm('Перейти к другой инструкции и отменить несохранённые изменения?')) return;
       const id = button.dataset.editOperator;
@@ -526,14 +570,15 @@
   $('run-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     if (isActive()) return showFormError('run-form-error', 'Дождитесь завершения текущего запуска.');
-    if (!validPreview('run')) return showFormError('run-form-error', 'Выберите доступную дату и дождитесь проверки периода.');
+    if (!validPreview('run')) return showFormError('run-form-error', 'Выберите доступный период и дождитесь его проверки.');
     const button = $('run-submit');
     button.disabled = true;
     state.pending = true;
     updateRunButtons();
     $('run-form-error').hidden = true;
     try {
-      await api('/api/run', { method: 'POST', body: JSON.stringify({ operator_id: $('run-operator').value, run_date: $('run-date').value }) });
+      const payload = { operator_id: $('run-operator').value, ...(monthlySelected() ? { report_month: $('run-month').value } : { run_date: $('run-date').value }) };
+      await api('/api/run', { method: 'POST', body: JSON.stringify(payload) });
       $('run-dialog').close();
       toast('Запуск принят. Результат появится в истории.');
       window.location.hash = 'runs';

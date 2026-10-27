@@ -68,6 +68,25 @@ rules: {}
     return data, operators
 
 
+def test_mixed_cards_import_publishes_complete_package(isolated_engine, tmp_path):
+    data, _ = isolated_engine
+    source = source_file(tmp_path / "mixed.xlsx")
+    book = load_workbook(source)
+    book.active.append([date(2026, 9, 17), "ДТ", 50, 4500, 4700, -2])
+    book.save(source)
+    book.close()
+    run = engine.submit("glopro", "2026-09-18", "import", [{"path": str(source), "name": "mixed.xlsx"}])
+    saved = storage.get_run(run["id"])
+    assert saved["status"] == "completed"
+    assert saved["failures"] == []
+    assert "82,95 рублей" in saved["report"]
+    assert "150,000 л | 13 000,00 рублей" in saved["report"]
+    root = data / "runs" / run["id"]
+    with zipfile.ZipFile(next(root.glob("Готовый комплект*.zip"))) as bundle:
+        assert bundle.testzip() is None
+        assert "Активация — 18.09.2026.xlsx" in bundle.namelist()
+
+
 def test_good_import_produces_named_audited_artifacts_and_valid_zip(isolated_engine, tmp_path):
     data, _ = isolated_engine
     source = source_file(tmp_path / "source.xlsx")

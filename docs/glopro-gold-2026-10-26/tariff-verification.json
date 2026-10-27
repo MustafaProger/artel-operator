@@ -1,0 +1,34 @@
+{
+  "tariff_id": 49170,
+  "version": 21,
+  "saved_at_msk": "2026-10-26 13:51:46",
+  "name": "ДТ: −4% золотые Лукойл; остальные +1% виртуальные / +2% пластик; бензин +3%",
+  "verification_surface": "GloPro /control/tariffs-fuel, Проверить тариф; explicit version 21",
+  "checks": [
+    {
+      "case": "gold_diesel",
+      "station": "16097",
+      "base": "78.00",
+      "result": "74.88",
+      "section": 1,
+      "percent": "-4"
+    },
+    {
+      "case": "ordinary_plastic_diesel",
+      "station": "33017",
+      "base": "80.01",
+      "result": "81.61",
+      "section": 3,
+      "percent": "+2"
+    },
+    {
+      "case": "gasoline",
+      "base": "73.75",
+      "result": "75.96",
+      "section": 4,
+      "percent": "+3"
+    }
+  ],
+  "historical_transactions_rewritten": false,
+  "operator_update": "instruction only; procurement algorithm unchanged"
+}

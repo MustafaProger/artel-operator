@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from calendar import monthrange
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from pathlib import Path
@@ -248,7 +249,67 @@ def _validate_rules(rules: dict | None) -> dict:
             result[key] = _date(result[key], key)
     if result.get("date_from") and result.get("date_to") and result["date_from"] > result["date_to"]:
         raise CalculationError("Начало периода позже окончания")
+    if "report_month" in result:
+        month = result["report_month"]
+        if not isinstance(month, str) or not re.fullmatch(r"\d{4}-\d{2}", month):
+            raise CalculationError("Месяц отчёта должен иметь формат ГГГГ-ММ")
+        try:
+            first = date.fromisoformat(month + "-01")
+            last = first.replace(day=monthrange(first.year, first.month)[1])
+        except ValueError:
+            raise CalculationError("Некорректный месяц отчёта") from None
+        if any(result.get(key) not in (None, value) for key, value in (("date_from", first), ("date_to", last))):
+            raise CalculationError("Месячный отчёт требует полный календарный месяц")
+        result.update(date_from=first, date_to=last)
     return result
+
+
+def _monthly_report(client, supplier, source_fuels, settings, audit):
+    """Client payables need source amounts, not a supplier card-price guess."""
+    is_special = _company_key(client) in {_company_key(name) for name in settings["special_clients"]}
+    groups = {}
+    for item in source_fuels:
+        fuel = _fuel(item["fuel"], 0)
+        group = groups.setdefault(fuel, {key: Decimal(0) for key in ("litres", "supplier_basis", "customer_total")})
+        for key in group:
+            group[key] += _decimal(item[key], f"{fuel}: {key}")
+    if is_special and any(fuel != "ДТ ЭКТО" for fuel in groups):
+        raise CalculationError(f"{client}: исключение для бензина не определено; уточните правило клиента")
+    totals = {key: Decimal(0) for key in ("litres", "supplier_basis", "customer_total")}
+    fuels, raw_fuels, reversed_fuels = [], [], []
+    with localcontext() as context:
+        context.prec = 32
+        for fuel, amounts in sorted(groups.items(), key=lambda item: (item[0] != "ДТ ЭКТО", item[0])):
+            if is_special:
+                amounts["customer_total"] = amounts["supplier_basis"] * settings["special_customer_multiplier"]
+            if amounts["litres"] == 0 and any(amounts[key] for key in ("supplier_basis", "customer_total")):
+                raise CalculationError(f"{fuel}: итоговый литраж равен нулю при ненулевой сумме")
+            raw_fuels.append({"fuel": fuel, **{key: str(value) for key, value in amounts.items()}})
+            for key, amount in amounts.items():
+                totals[key] += amount
+            if amounts["litres"] == 0:
+                reversed_fuels.append(fuel)
+                continue
+            fuels.append({"fuel": fuel, **{key: _litres(value) if key == "litres" else _money(value)
+                                           for key, value in amounts.items()}})
+    return {
+        "client": client, "supplier": supplier, "report_month": settings["report_month"], "card_type": None,
+        "status": "ready" if fuels else "fully_reversed" if audit.get("operation_count") else "no_data",
+        "fuels": fuels,
+        "totals": {key: _litres(value) if key == "litres" else _money(value) for key, value in totals.items()},
+        "audit": {**audit, "report_month": settings["report_month"], "special_client": is_special,
+                  "fully_reversed_fuels": reversed_fuels, "raw_fuels": raw_fuels,
+                  "raw_totals": {key: str(value) for key, value in totals.items()}},
+    }
+
+
+def _diesel_supplier_total(basis_by_type: dict, settings: dict, is_special: bool) -> Decimal:
+    if is_special:
+        return sum(basis_by_type.values(), Decimal(0)) * settings["virtual_diesel_multiplier"]
+    if set(basis_by_type) - {"virtual", "plastic"}:
+        raise CalculationError("Тип дизельной карты не определён по скидке; требуется проверка")
+    return sum((basis * settings[f"{kind}_diesel_multiplier"]
+                for kind, basis in basis_by_type.items()), Decimal(0))
 
 
 def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
@@ -276,6 +337,21 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
         if not client and metadata_clients:
             client = sorted(metadata_clients)[0]
         kind = weekly_kind(client, settings.get("client_id"))
+        if settings.get("report_month"):
+            if not client:
+                raise CalculationError("Не удалось определить фирму: задайте rules.client или добавьте колонку Клиент")
+            if sheet_name != "transactions":
+                raise CalculationError("Для месячного расчёта нужен лист transactions")
+            from .weekly import calculate_weekly
+            checked = calculate_weekly(rows, header_index, columns, client, kind or "monthly", settings)
+            if kind:
+                checked["report_month"] = settings["report_month"]
+                checked["audit"]["report_month"] = settings["report_month"]
+                return checked
+            audit = {key: value for key, value in checked["audit"].items() if key != "raw_groups"}
+            audit.update(source_raw_totals=checked["audit"]["raw_totals"],
+                         source_raw_groups=checked["audit"]["raw_groups"])
+            return _monthly_report(client, settings["supplier"], checked["audit"]["raw_groups"], settings, audit)
         if kind:
             from .weekly import calculate_weekly
             if sheet_name != "transactions":
@@ -286,6 +362,7 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
         groups: dict[str, dict] = {}
         transaction_dates = []
         discount_types = set()
+        diesel_basis_by_type = {}
         skipped_summaries = []
         skipped_headers = []
         transaction_rows = []
@@ -353,11 +430,13 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
                 if "%" in number_format and not isinstance(cell("discount"), str):
                     discount *= 100
                 if abs(discount + 1) <= settings["card_discount_tolerance"]:
-                    discount_types.add("virtual")
+                    row_card_type = "virtual"
                 elif abs(discount + 2) <= settings["card_discount_tolerance"]:
-                    discount_types.add("plastic")
+                    row_card_type = "plastic"
                 else:
-                    discount_types.add("unknown")
+                    row_card_type = "unknown"
+                discount_types.add(row_card_type)
+                diesel_basis_by_type[row_card_type] = diesel_basis_by_type.get(row_card_type, Decimal(0)) + amounts["supplier_basis"]
         client_keys = {company_identity(value) for value in metadata_clients}
         if len(client_keys) > 1 or (client and client_keys and company_identity(client) not in client_keys):
             raise CalculationError("В файле указана другая фирма или несколько фирм; проверьте выгрузку")
@@ -366,16 +445,14 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
         if not client:
             raise CalculationError("Не удалось определить фирму: задайте rules.client или добавьте колонку Клиент")
         is_special = _company_key(client) in {_company_key(name) for name in settings["special_clients"]}
-        if len(discount_types - {"unknown"}) > 1:
-            raise CalculationError("В дизельных операциях смешаны виртуальные и пластиковые карты; требуется раздельный расчёт")
         if is_special and any(fuel != "ДТ ЭКТО" for fuel in groups):
             raise CalculationError(f"{client}: исключение для бензина не определено; уточните правило клиента")
         if is_special:
             card_type = "virtual"
-        elif "ДТ ЭКТО" in groups and groups["ДТ ЭКТО"]["litres"] != 0:
+        elif discount_types:
             if not discount_types or "unknown" in discount_types:
                 raise CalculationError("Тип дизельной карты не определён по скидке; требуется проверка")
-            card_type = next(iter(discount_types))
+            card_type = "mixed" if len(discount_types) > 1 else next(iter(discount_types))
             if settings.get("card_type") and settings["card_type"] != card_type:
                 raise CalculationError("Заданный тип карты противоречит скидке в выгрузке")
         else:
@@ -387,19 +464,22 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
         with localcontext() as context:
             context.prec = 32
             for fuel, group in sorted(groups.items(), key=lambda item: (item[0] != "ДТ ЭКТО", item[0])):
+                supplier_total = group["supplier_basis"] * settings["gasoline_multiplier"]
+                raw_card_basis = {}
+                if fuel == "ДТ ЭКТО":
+                    supplier_total = _diesel_supplier_total(diesel_basis_by_type, settings, is_special)
+                    raw_card_basis = {"supplier_basis_by_card_type": {key: str(value) for key, value in diesel_basis_by_type.items()}}
                 if group["litres"] == 0:
-                    if group["supplier_basis"] != 0 or group["customer_total"] != 0:
+                    if group["supplier_basis"] != 0 or group["customer_total"] != 0 or supplier_total != 0:
                         raise CalculationError(f"{fuel}: итоговый литраж равен нулю при ненулевой сумме")
                     reversed_fuels.append(fuel)
-                    raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in ("litres", "supplier_basis", "customer_total")}})
+                    raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in ("litres", "supplier_basis", "customer_total")}, **raw_card_basis})
                     continue
-                multiplier = settings["gasoline_multiplier"]
                 if fuel == "ДТ ЭКТО":
-                    multiplier = settings[f"{card_type}_diesel_multiplier"]
                     if is_special:
                         group["customer_total"] = group["supplier_basis"] * settings["special_customer_multiplier"]
-                price = group["supplier_basis"] / group["litres"] * multiplier
-                raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in ("litres", "supplier_basis", "customer_total")}})
+                price = supplier_total / group["litres"]
+                raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in ("litres", "supplier_basis", "customer_total")}, **raw_card_basis})
                 fuels.append({"fuel": fuel, "litres": _litres(group["litres"]), "supplier_basis": _money(group["supplier_basis"]), "customer_total": _money(group["customer_total"]), "supplier_price": _money(price), "rows": group["rows"]})
                 for key in totals:
                     totals[key] += group[key]
@@ -426,6 +506,38 @@ def merge_reports(reports: Iterable[dict], rules: dict | None = None) -> dict:
     reports = list(reports)
     if not reports:
         raise CalculationError("Нет отчётов для объединения")
+    if (rules or {}).get("report_month") or any(report.get("report_month") for report in reports):
+        months = {report.get("report_month") for report in reports}
+        if len(months) != 1 or None in months:
+            raise CalculationError("Нельзя объединять месячные отчёты разных периодов или видов")
+        month = next(iter(months))
+        if (rules or {}).get("report_month", month) != month:
+            raise CalculationError("Месяц объединяемых договоров не совпадает с запросом")
+        settings = _validate_rules({**(rules or {}), "report_month": month})
+        identities = {(company_identity(report["client"]), report["supplier"], report.get("weekly_kind")) for report in reports}
+        if len(identities) != 1:
+            raise CalculationError("Нельзя объединять разные фирмы или правила месячного расчёта")
+        periods = {tuple(report.get("audit", {}).get("verified_period", [])) for report in reports}
+        if len(periods) != 1 or any(len(period) != 2 for period in periods):
+            raise CalculationError("Периоды договоров не совпадают или не проверены")
+        verified_period = next(iter(periods))
+        expected_period = (f'{settings["date_from"]}T00:00:00+03:00', f'{settings["date_to"]}T23:59:59+03:00')
+        if verified_period != expected_period:
+            raise CalculationError("Периоды договоров не соответствуют полному месяцу")
+        if any(report.get("status") not in {"ready", "no_data", "fully_reversed"} for report in reports):
+            raise CalculationError("Объединять можно только проверенные результаты расчёта")
+        if reports[0].get("weekly_kind"):
+            from .weekly import merge_weekly_reports
+            merged = merge_weekly_reports(reports)
+            merged["report_month"] = month
+            merged["audit"]["report_month"] = month
+            return merged
+        return _monthly_report(reports[0]["client"], reports[0]["supplier"],
+                               [fuel for report in reports for fuel in report["audit"]["raw_fuels"]], settings, {
+            "merged": True, "source_reports": reports, "verified_period": list(verified_period),
+            "contract_ids": [report.get("contract_id") for report in reports],
+            "operation_count": sum(report["audit"]["operation_count"] for report in reports),
+        })
     if any(report.get("weekly_kind") for report in reports):
         from .weekly import merge_weekly_reports
         return merge_weekly_reports(reports)
@@ -441,13 +553,12 @@ def merge_reports(reports: Iterable[dict], rules: dict | None = None) -> dict:
         raise CalculationError("Заданный поставщик не совпадает с объединяемыми договорами")
     active = [report for report in reports if report.get("status") == "ready" and report.get("fuels")]
     card_types = {report.get("card_type") for report in active} - {None}
-    if card_types - {"virtual", "plastic"}:
+    if card_types - {"virtual", "plastic", "mixed"}:
         raise CalculationError("Неизвестный тип карты в договорах")
-    if len(card_types) > 1:
-        raise CalculationError("В договорах смешаны виртуальные и пластиковые карты; требуется проверка")
     is_special = _company_key(client) in {_company_key(name) for name in settings["special_clients"]}
-    card_type = "virtual" if is_special else next(iter(card_types), settings.get("card_type"))
+    card_type = "virtual" if is_special else "mixed" if len(card_types) > 1 else next(iter(card_types), settings.get("card_type"))
     groups = {}
+    diesel_basis_by_type = {}
     dates_from, dates_to = [], []
     for source_index, report in enumerate(reports):
         if report.get("status") not in ("ready", "no_data", "fully_reversed"):
@@ -469,6 +580,23 @@ def merge_reports(reports: Iterable[dict], rules: dict | None = None) -> dict:
             group = groups.setdefault(fuel, {"litres": Decimal(0), "supplier_basis": Decimal(0), "customer_total": Decimal(0), "rows": []})
             for key in ("litres", "supplier_basis", "customer_total"):
                 group[key] += _decimal(item[key], f"{key}, договор {source_index + 1}")
+            if fuel == "ДТ ЭКТО":
+                basis = _decimal(item["supplier_basis"], "база дизеля")
+                breakdown = item.get("supplier_basis_by_card_type")
+                if breakdown is None:
+                    source_type = "virtual" if is_special else report.get("card_type")
+                    if source_type not in {"virtual", "plastic"}:
+                        if basis == 0 and report.get("status") == "fully_reversed":
+                            breakdown = {}
+                        else:
+                            raise CalculationError("Нет разбивки базы дизеля по типам карт договора")
+                    else:
+                        breakdown = {source_type: basis}
+                breakdown = {key: _decimal(value, "база по типу карты") for key, value in breakdown.items()}
+                if sum(breakdown.values(), Decimal(0)) != basis:
+                    raise CalculationError("База дизеля по типам карт не совпадает с итогом договора")
+                for key, value in breakdown.items():
+                    diesel_basis_by_type[key] = diesel_basis_by_type.get(key, Decimal(0)) + value
             group["rows"].append({"report": source_index, "fuel": fuel})
     if is_special and any(fuel != "ДТ ЭКТО" for fuel in groups):
         raise CalculationError(f"{client}: исключение для бензина не определено; уточните правило клиента")
@@ -479,21 +607,24 @@ def merge_reports(reports: Iterable[dict], rules: dict | None = None) -> dict:
     with localcontext() as context:
         context.prec = 32
         for fuel, group in sorted(groups.items(), key=lambda item: (item[0] != "ДТ ЭКТО", item[0])):
+            supplier_total = group["supplier_basis"] * settings["gasoline_multiplier"]
+            raw_card_basis = {}
+            if fuel == "ДТ ЭКТО":
+                supplier_total = _diesel_supplier_total(diesel_basis_by_type, settings, is_special)
+                raw_card_basis = {"supplier_basis_by_card_type": {key: str(value) for key, value in diesel_basis_by_type.items()}}
             if group["litres"] == 0:
-                if group["supplier_basis"] != 0 or group["customer_total"] != 0:
+                if group["supplier_basis"] != 0 or group["customer_total"] != 0 or supplier_total != 0:
                     raise CalculationError(f"{fuel}: итоговый литраж равен нулю при ненулевой сумме")
                 reversed_fuels.append(fuel)
-                raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in totals}})
+                raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in totals}, **raw_card_basis})
                 continue
-            multiplier = settings["gasoline_multiplier"]
             if fuel == "ДТ ЭКТО":
                 if not card_type:
                     raise CalculationError("Тип дизельных карт договоров не определён")
-                multiplier = settings[f"{card_type}_diesel_multiplier"]
                 if is_special:
                     group["customer_total"] = group["supplier_basis"] * settings["special_customer_multiplier"]
-            price = group["supplier_basis"] / group["litres"] * multiplier
-            raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in totals}})
+            price = supplier_total / group["litres"]
+            raw_fuels.append({"fuel": fuel, **{key: str(group[key]) for key in totals}, **raw_card_basis})
             fuels.append({"fuel": fuel, "litres": _litres(group["litres"]), "supplier_basis": _money(group["supplier_basis"]), "customer_total": _money(group["customer_total"]), "supplier_price": _money(price), "rows": group["rows"]})
             for key in totals:
                 totals[key] += group[key]

@@ -107,7 +107,13 @@
 
     <dialog id="run-dialog" class="modal">
       <div class="modal-heading"><div><span class="eyebrow">РУЧНОЙ ЗАПУСК</span><h2>Подготовить отчёт</h2></div><button type="button" class="icon-button" data-close="run-dialog" aria-label="Закрыть"><span data-icon="close"></span></button></div>
-      <form id="run-form"><label class="field-label" for="run-operator">Оператор</label><select id="run-operator" required></select><label class="field-label" for="run-date">Дата планового запуска</label><input id="run-date" type="date" required /><p class="field-hint" id="run-period-preview">Выберите дату актирования. Период определится по расписанию и сохранённой истории.</p><div class="modal-note"><span data-icon="info"></span>Оператор скачает выгрузки и подготовит пакет файлов. Готовый результат появится в истории.</div><div id="run-form-error" class="inline-message error" hidden role="alert"></div><div class="modal-actions"><button class="button button-secondary" type="button" data-close="run-dialog">Отмена</button><button class="button button-primary" id="run-submit" type="submit" disabled><span data-icon="play"></span>Запустить расчёт</button></div></form>
+      <form id="run-form">
+        <label class="field-label" for="run-operator">Оператор</label><select id="run-operator" required></select>
+        <div id="run-mode-field"><label class="field-label" for="run-mode">Вид отчёта</label><select id="run-mode"><option value="scheduled">По дате актирования</option><option value="monthly">Месячный отчёт по всем фирмам</option></select></div>
+        <div id="run-date-field"><label class="field-label" for="run-date">Дата планового запуска</label><input id="run-date" type="date" required /></div>
+        <div id="run-month-field" hidden><label class="field-label" for="run-month">Завершённый месяц</label><input id="run-month" type="month" disabled /><p class="field-hint">Полный календарный месяц по всем фирмам: литры и сумма к оплате нам с учётом наценок и скидок из инструкции.</p></div>
+        <p class="field-hint" id="run-period-preview" aria-live="polite">Выберите дату актирования. Период определится по расписанию и сохранённой истории.</p><div class="modal-note"><span data-icon="info"></span>Оператор скачает выгрузки и подготовит пакет файлов. Готовый результат появится в истории.</div><div id="run-form-error" class="inline-message error" hidden role="alert"></div><div class="modal-actions"><button class="button button-secondary" type="button" data-close="run-dialog">Отмена</button><button class="button button-primary" id="run-submit" type="submit" disabled><span data-icon="play"></span>Запустить расчёт</button></div>
+      </form>
     </dialog>
 
     <dialog id="import-dialog" class="modal">

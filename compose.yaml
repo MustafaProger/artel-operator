@@ -8,6 +8,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./operators:/app/operators
+      - ./knowledge:/app/knowledge:ro
     environment:
       TZ: Europe/Moscow
+      OPERATOR_SCHEDULER_ENABLED: ${OPERATOR_SCHEDULER_ENABLED:-false}
+      OPERATOR_KNOWLEDGE_DIR: /app/knowledge
     shm_size: '1gb'

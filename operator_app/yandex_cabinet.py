@@ -10,6 +10,9 @@ from zoneinfo import ZoneInfo
 import json
 import re
 import uuid
+import time as clock
+
+from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout
 
 from .yandex_reports import CANCELLED_ORDER_STATUSES, number, phone_hash, text, display_name
 
@@ -45,22 +48,52 @@ class Cabinet:
             raise CabinetError("Организация запроса не совпала с кабинетом")
 
     def request(self, path, payload=None, params=None):
+        operation = {
+            ORDERS: "загрузка заказов",
+            REPORTS + "history": "загрузка списка отчётов",
+            REPORTS + "tab-columns": "загрузка столбцов отчёта",
+            REPORTS + "status": "проверка готовности отчёта",
+            REPORTS + "generate": "создание отчёта",
+        }.get(path, "запрос кабинета")
+        generating = path == REPORTS + "generate"
+        uncertain = (" Результат создания неизвестен. Перед повтором проверьте список отчётов в кабинете."
+                     if generating else "")
+        incomplete = ("отсутствие операций не подтверждено" if path == ORDERS else "выгрузка не завершена")
         url = API + path + ("?" + urlencode(params) if params else "")
         headers = dict(self.headers)
         if path == REPORTS + "generate":
             headers["x-idempotency-token"] = str(uuid.uuid4())
-        response = self.context.request.fetch(url, method="GET" if payload is None else "POST",
-            headers=headers, data=json.dumps(payload) if payload is not None else None,
-            timeout=60000, max_redirects=0)
-        if response.status != 200:
-            raise CabinetError("Ошибка загрузки данных Яндекса; отсутствие операций не подтверждено")
-        try:
-            result = response.json()
-        except Exception:
-            raise CabinetError("Яндекс вернул некорректные данные; требуется повторная проверка") from None
-        if not isinstance(result, dict) or "error" in result:
-            raise CabinetError("Ответ кабинета Яндекса не подтверждён")
-        return result
+        # Only observed read endpoints may be repeated, including read-only POSTs.
+        # Never repeat generation after an ambiguous response from the server.
+        attempts = 3 if path in {ORDERS, REPORTS + "history", REPORTS + "status", REPORTS + "tab-columns"} else 1
+        for attempt in range(attempts):
+            response = None
+            try:
+                response = self.context.request.fetch(url, method="GET" if payload is None else "POST",
+                    headers=headers, data=json.dumps(payload) if payload is not None else None,
+                    timeout=60000, max_redirects=0)
+                if response.status == 429 or 500 <= response.status < 600:
+                    if attempt + 1 == attempts:
+                        raise CabinetError(f"Яндекс: {operation} — HTTP {response.status}. "
+                                           f"Сервис временно недоступен; {incomplete}." + uncertain)
+                elif response.status != 200:
+                    raise CabinetError(f"Яндекс: {operation} — HTTP {response.status}. Запрос не подтверждён." + uncertain)
+                else:
+                    try:
+                        result = response.json()
+                    except Exception:
+                        raise CabinetError(f"Яндекс: {operation} — некорректные данные; требуется проверка." + uncertain) from None
+                    if not isinstance(result, dict) or "error" in result:
+                        raise CabinetError(f"Яндекс: {operation} — ответ кабинета не подтверждён." + uncertain)
+                    return result
+            except PlaywrightError as exc:
+                transient = isinstance(exc, PlaywrightTimeout) or "net::ERR_" in str(exc)
+                if not transient or attempt + 1 == attempts:
+                    raise CabinetError(f"Яндекс: {operation} — сбой соединения; запрос не подтверждён." + uncertain) from None
+            finally:
+                if response is not None:
+                    response.dispose()
+            clock.sleep(attempt + 1)
 
     def orders_page(self, start, end, cursor, limit):
         # Include fractional seconds of the final day, which the UI's 23:59:59 omits.

@@ -33,6 +33,26 @@ class GloProError(ValueError):
     """Actionable failure that never includes credentials or browser call logs."""
 
 
+class _TransientReadError(GloProError):
+    """A retryable preparation failure, before report generation starts."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        super().__init__(f"GloPro не загрузил этап «{stage}».")
+
+
+@contextmanager
+def _read_stage(stage: str):
+    try:
+        yield
+    except GloProError:
+        raise
+    except Exception as error:
+        if type(error).__name__ == "TimeoutError" or "net::ERR_" in str(error):
+            raise _TransientReadError(stage) from None
+        raise GloProError(f"Не удалось прочитать этап «{stage}» в GloPro: интерфейс изменился или ответ не подтверждён.") from None
+
+
 def activity_from_recent(payload, first, last):
     """The account endpoint exposes the latest ten rows, not full history.
 
@@ -508,15 +528,25 @@ class GloProConnector:
                         continue
                 return {"checked": True, "section": marker.group(0), "visible_date_count": len(dates), "visible_dates": sorted(set(dates)), "scope": "visible_account_preview_only"}
             page.wait_for_timeout(150)
-        raise GloProError("Вкладка «Счет» не загрузила данные; проверка счёта не подтверждена.")
+        raise _TransientReadError("данные счёта")
 
     def _contracts(self, page, client):
         # Read the complete selector on the firm itself, including contracts that
         # could be absent from the overview's current filter.
-        self._goto(page, client["url"])
-        selector = page.locator('select[name="contracts_list"]')
-        selector.wait_for(state="attached")
-        ids = selector.locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
+        for attempt in range(3):
+            self._goto(page, client["url"])
+            try:
+                with _read_stage("список договоров"):
+                    if page.locator("form#login").count() == 1:
+                        raise GloProError("Сессия GloPro завершилась; требуется повторный вход.")
+                    selector = page.locator('select[name="contracts_list"]')
+                    selector.wait_for(state="attached")
+                    ids = selector.locator("option").evaluate_all("els => els.map(e => e.value).filter(Boolean)")
+                break
+            except _TransientReadError as error:
+                if attempt == 2:
+                    raise GloProError(f"GloPro не загрузил этап «{error.stage}» после 3 попыток чтения. Полнота списка не подтверждена.") from None
+                page.wait_for_timeout(700 * (attempt + 1))
         contracts = []
         seen = set()
         observed = {c["id"]: c["url"] for c in client.get("contracts", [])}
@@ -568,43 +598,67 @@ class GloProConnector:
             page.wait_for_timeout(700 * (attempt + 1))
 
     def _prepare_report(self, page, client: dict, contract: dict, first: date, last: date):
-        selector = page.locator('select[name="contracts_list"]')
-        already_selected = urlparse(page.url).path == urlparse(client["url"]).path and selector.count() == 1 and selector.input_value() == contract["id"]
-        if not already_selected:
-            self._goto(page, contract["url"])
-        account = page.locator('.ajax_contract_block a[href="#account"][ajax_tab]')
-        account.wait_for(state="visible")
-        account.click()
-        page.locator('.ajax_contract_block a[href="#account"].active').wait_for(state="visible")
-        account_preview = self._read_account_preview(page)
-        activity = self._check_activity(page, contract, first, last)
+        # Only navigation, reads and local form fields are repeated. _download
+        # remains outside this boundary and can click Generate only once.
+        for attempt in range(3):
+            if attempt:
+                self._goto(page, contract["url"])
+            try:
+                return self._prepare_report_once(page, client, contract, first, last)
+            except _TransientReadError as error:
+                if attempt == 2:
+                    raise GloProError(f"GloPro не загрузил этап «{error.stage}» после 3 попыток чтения. Формирование отчёта для этого договора не запускалось.") from None
+                page.wait_for_timeout(700 * (attempt + 1))
+
+    def _prepare_report_once(self, page, client: dict, contract: dict, first: date, last: date):
+        with _read_stage("выбор договора"):
+            if page.locator("form#login").count() == 1:
+                raise GloProError("Сессия GloPro завершилась; требуется повторный вход.")
+            selector = page.locator('select[name="contracts_list"]')
+            already_selected = urlparse(page.url).path == urlparse(client["url"]).path and selector.count() == 1 and selector.input_value() == contract["id"]
+            if not already_selected:
+                self._goto(page, contract["url"])
+        with _read_stage("вкладка счёта"):
+            account = page.locator('.ajax_contract_block a[href="#account"][ajax_tab]')
+            account.wait_for(state="visible")
+            account.click()
+            page.locator('.ajax_contract_block a[href="#account"].active').wait_for(state="visible")
+        with _read_stage("данные счёта"):
+            account_preview = self._read_account_preview(page)
+        with _read_stage("проверка операций"):
+            activity = self._check_activity(page, contract, first, last)
         account_preview["activity"] = activity
         if activity["has_operations"] is False:
             return account_preview
-        page.locator('.ajax_contract_block a[href="#reports"][ajax_tab]').click()
-        select = page.locator(FORM + " select.report_select")
-        select.wait_for(state="visible")
-        selected = select.select_option(label="Транзакционный отчет со скидкой")
-        if len(selected) != 1:
-            raise GloProError("Не найден транзакционный отчёт со скидкой.")
-        form = page.locator(FORM + f' .report_template_block[report="{selected[0]}"]')
-        form.locator('input[name="period_start"]').wait_for(state="visible")
-        expected = [("client_choose_single", client["id"]), ("contract_choose_single", contract["id"])]
-        for field, ident in expected:
-            hidden = form.locator(f'.combobox_outer:has(input[name^="{field}"]) input[name="combobox_value"]')
-            deadline = time.monotonic() + 5
-            while hidden.count() == 1 and hidden.input_value() != ident and time.monotonic() < deadline:
-                page.wait_for_timeout(100)
-            if hidden.count() != 1 or hidden.input_value() != ident:
-                raise GloProError("Форма отчёта GloPro выбрала другую фирму или договор.")
-        self._fill_date(form.locator('input[name="period_start"]'), first)
-        self._fill_date(form.locator('input[name="period_end"]'), last)
-        # GloPro styles the format as a clickable label; its native radio can
-        # be hidden. Click the visible control, then verify the actual value.
-        xlsx = form.locator('[format="xlsx"]')
-        xlsx.click()
-        if not xlsx.locator('input[type="radio"]').is_checked():
-            raise GloProError("GloPro не подтвердил выбор формата XLSX.")
+        with _read_stage("вкладка отчётов"):
+            page.locator('.ajax_contract_block a[href="#reports"][ajax_tab]').click()
+            select = page.locator(FORM + " select.report_select")
+            select.wait_for(state="visible")
+        with _read_stage("шаблон отчёта"):
+            selected = select.select_option(label="Транзакционный отчет со скидкой")
+            if len(selected) != 1:
+                raise GloProError("Не найден транзакционный отчёт со скидкой.")
+            form = page.locator(FORM + f' .report_template_block[report="{selected[0]}"]')
+            form.locator('input[name="period_start"]').wait_for(state="visible")
+        with _read_stage("фирма и договор в форме"):
+            expected = [("client_choose_single", client["id"]), ("contract_choose_single", contract["id"])]
+            for field, ident in expected:
+                hidden = form.locator(f'.combobox_outer:has(input[name^="{field}"]) input[name="combobox_value"]')
+                deadline = time.monotonic() + 5
+                while hidden.count() == 1 and hidden.input_value() != ident and time.monotonic() < deadline:
+                    page.wait_for_timeout(100)
+                if hidden.count() != 1 or hidden.input_value() != ident:
+                    raise GloProError("Форма отчёта GloPro выбрала другую фирму или договор.")
+        with _read_stage("даты отчётного периода"):
+            self._fill_date(form.locator('input[name="period_start"]'), first)
+            self._fill_date(form.locator('input[name="period_end"]'), last)
+        with _read_stage("формат XLSX"):
+            # GloPro styles the format as a clickable label; its native radio can
+            # be hidden. Click the visible control, then verify the actual value.
+            xlsx = form.locator('[format="xlsx"]')
+            xlsx.click()
+            if not xlsx.locator('input[type="radio"]').is_checked():
+                raise GloProError("GloPro не подтвердил выбор формата XLSX.")
         return account_preview
 
     @staticmethod
@@ -740,13 +794,18 @@ class GloProConnector:
                 selected = sorted(eligible, key=lambda client: alphabet_key(client["name"]))
                 if not selected:
                     raise GloProError("Все выбранные клиенты временно исключены; нет клиентов для отчёта.")
-                notify({"stage": "clients", "message": f"Найдено клиентов: {len(selected)}", "total": len(selected)})
+                notify({"stage": "clients", "message": f"Найдено клиентов: {len(selected)}", "total": len(selected),
+                        "clients": [{"id": client["id"], "name": client["name"]} for client in selected]})
                 for index, client in enumerate(selected, 1):
                     client_first, client_last = periods[client["id"]]
                     notify({"stage": "downloading", "message": f"Выгрузка: {client['name']}", "client": client["name"], "current": index, "total": len(selected)})
                     contracts = self._contracts(page, client)
+                    if plan and plan.get("kind") == "monthly_summary":
+                        notify({"stage": "contracts", "client": client["name"], "client_id": client["id"],
+                                "contract_ids": [contract["id"] for contract in contracts],
+                                "message": f"Проверен список договоров: {client['name']} ({len(contracts)})"})
                     if not contracts:
-                        notify({"stage": "no_contract", "message": f"Нет договоров: {client['name']}", "client": client["name"]})
+                        notify({"stage": "no_contract", "message": f"Нет договоров: {client['name']}", "client": client["name"], "client_id": client["id"]})
                         continue
                     for contract in contracts:
                         account_preview = self._prepare_report(page, client, contract, client_first, client_last)

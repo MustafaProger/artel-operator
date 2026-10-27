@@ -79,6 +79,10 @@ def test_generation_diagnostics_and_result(isolated, monkeypatch, outcome):
     diagnostic = storage.DATA / "logs/seo-generation.log"
     assert "private provider diagnostic" in diagnostic.read_text()
     assert diagnostic.stat().st_mode & 0o777 == 0o600
+    archived = list((storage.DATA / "logs").glob("seo-*-draft-*.log"))
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == diagnostic.read_bytes()
+    assert archived[0].stat().st_mode & 0o777 == 0o600
     assert not list(directory.glob("*.log"))
 
 
@@ -206,11 +210,61 @@ def test_unapproved_review_never_saves_publishable_edition(isolated, monkeypatch
     draft, context = content()
     draft["article"]["publishedAt"] = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
     monkeypatch.setattr(seo, "collect_context", lambda c: context)
-    responses = iter([draft, {"approved": False, "sourceGrounded": False, "distinctIntent": True, "usefulForBuyer": True, "issues": ["Недоказанный факт"]}])
+    responses = iter([draft, {"approved": False, "sourceGrounded": False, "distinctIntent": True, "usefulForBuyer": True, "issues": ["Недоказанный факт"]}] * 3)
     monkeypatch.setattr(seo, "_generate", lambda *args: next(responses))
     with pytest.raises(ValueError, match="Недоказанный факт"):
         seo.prepare_article(conf(), {"run_date": "2026-09-23"}, isolated, lambda event: None)
     assert seo._get("rusplast-seo", "2026-09-23") is None
+    assert list(responses) == []
+    assert len(list(isolated.glob("review-attempt-*.json"))) == 3
+
+
+@pytest.mark.parametrize("problem", ["review", "validation", "invalid-revision"])
+def test_editorial_revision_rechecks_all_gates(isolated, monkeypatch, problem):
+    draft, context = content()
+    draft["article"]["publishedAt"] = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    corrected = deepcopy(draft)
+    corrected["article"]["imageAlt"] = "Бухта серой гофротрубы на светлом столе"
+    approved = dict(approved=True, sourceGrounded=True, distinctIntent=True, usefulForBuyer=True, issues=[])
+    rejected = {**approved, "approved": False, "sourceGrounded": False, "issues": ["Уберите неподтверждённую проволоку"]}
+    if problem == "validation":
+        draft["article"]["imageAlt"] = ""
+        responses = [draft, corrected, approved]
+    elif problem == "invalid-revision":
+        corrected["evidence"][0]["sourceExcerpt"] = "Факт, отсутствующий в источнике"
+        responses = [draft, rejected, corrected, corrected]
+    else:
+        responses = [draft, rejected, corrected, approved]
+    responses = iter(responses)
+    stages, events = [], []
+    monkeypatch.setattr(seo, "collect_context", lambda c: context)
+    def generate(c, directory, prompt, schema, name):
+        stages.append(name)
+        if name.startswith("draft-revision"):
+            assert "ДОРАБОТКА" in prompt
+            assert ("длину imageAlt" if problem == "validation" else
+                    "Цитата источника не найдена" if name.endswith("2") else "Уберите неподтверждённую проволоку") in prompt
+        if name.startswith("review-revision"):
+            assert corrected["article"]["imageAlt"] in prompt
+        return deepcopy(next(responses))
+    monkeypatch.setattr(seo, "_generate", generate)
+    def cover(*args):
+        assert problem != "invalid-revision", "Invalid revision must never reach image generation"
+        raise ValueError("stop at approved cover stage")
+    monkeypatch.setattr(seo, "_generate_cover", cover)
+    with pytest.raises(ValueError, match="Цитата источника" if problem == "invalid-revision" else "approved cover"):
+        seo.prepare_article(conf(), {"run_date": "2026-10-05"}, isolated, events.append)
+    edition = seo._get("rusplast-seo", "2026-10-05")
+    if problem == "invalid-revision":
+        assert edition is None
+        assert stages == ["draft", "review", "draft-revision-1", "draft-revision-2"]
+    else:
+        assert edition["status"] == "reviewed"
+        assert edition["draft"]["article"]["imageAlt"] == corrected["article"]["imageAlt"]
+        assert edition["review"] == approved
+        assert stages[-1] == "review-revision-1"
+    assert any(event["stage"] == "seo-revise" for event in events)
+    assert list(responses) == []
 
 
 def test_cover_failure_preserves_reviewed_draft_for_retry(isolated, monkeypatch):

@@ -1,0 +1,29 @@
+{
+  "verifiedAt": "2026-10-27T01:51:23.624Z",
+  "count": 20,
+  "exactSet": true,
+  "online": 20,
+  "offline": 20,
+  "hrefs": [
+    "/clients/client/78830?tab=contract&contract_id=105886",
+    "/clients/client/78927?tab=contract&contract_id=106013",
+    "/clients/client/78934?tab=contract&contract_id=106020",
+    "/clients/client/79011?tab=contract&contract_id=106123",
+    "/clients/client/79151?tab=contract&contract_id=106331",
+    "/clients/client/79172?tab=contract&contract_id=106357",
+    "/clients/client/79381?tab=contract&contract_id=106634",
+    "/clients/client/79387?tab=contract&contract_id=106643",
+    "/clients/client/79490?tab=contract&contract_id=106774",
+    "/clients/client/81079?tab=contract&contract_id=108880",
+    "/clients/client/81175?tab=contract&contract_id=108986",
+    "/clients/client/82029?tab=contract&contract_id=109933",
+    "/clients/client/82049?tab=contract&contract_id=109955",
+    "/clients/client/82210?tab=contract&contract_id=110164",
+    "/clients/client/82533?tab=contract&contract_id=110554",
+    "/clients/client/82657?tab=contract&contract_id=110741",
+    "/clients/client/83012?tab=contract&contract_id=111204",
+    "/clients/client/83706?tab=contract&contract_id=112042",
+    "/clients/client/84390?tab=contract&contract_id=112930",
+    "/clients/client/86915?tab=contract&contract_id=115918"
+  ]
+}

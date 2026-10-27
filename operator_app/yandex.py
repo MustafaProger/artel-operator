@@ -45,10 +45,14 @@ def download_employee(cabinet, page, directory, employee, start, end, company, a
         progress({"stage": "skipped", "reason": "no_operations", "client": employee["name"],
                   "user_id": employee["user_id"], "period": [str(start), str(end)]})
         return None
+    progress({"stage": "checking", "client": employee["name"],
+              "message": "Проверяем список ранее созданных отчётов Яндекса"})
     history = cabinet.request(REPORTS + "history")
     if not isinstance(history.get("reports"), list):
         raise YandexError("Не удалось проверить список ранее созданных отчётов")
     before = {r["task_id"] for r in history["reports"]}
+    progress({"stage": "checking", "client": employee["name"],
+              "message": "Проверяем доступность столбцов отчёта Яндекса"})
     tabs = cabinet.request(REPORTS + "tab-columns").get("tanker")
     if not isinstance(tabs, list) or len(tabs) != 1 or tabs[0].get("tab") != "report.report":
         raise YandexError("Изменился формат отчётов Яндекса")
@@ -56,6 +60,9 @@ def download_employee(cabinet, page, directory, employee, start, end, company, a
     required = {"due_data", "user_fullname", "user_phone", "order_id", "fuel_type", "fuel_filled", "status", "price"}
     if not required.issubset(columns):
         raise YandexError("В отчёте Яндекса недостаёт столбцов для проверки")
+    progress({"stage": "checking", "client": employee["name"],
+              "user_id": employee["user_id"], "report_creation_requested": True,
+              "message": "Запрашиваем создание нового отчёта Яндекса"})
     created = cabinet.request(REPORTS + "generate", {
         "service": "tanker", "since_date": str(start), "till_date": str(end),
         "time_zone": "+03:00", "user_ids": [employee["user_id"]],
