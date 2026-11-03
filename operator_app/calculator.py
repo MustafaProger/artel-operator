@@ -52,6 +52,8 @@ _ALIASES = {
     "client": {"клиент", "организация", "фирма", "наименование клиента", "наименование организации"},
     "holder": {"держатель", "держатель карты"},
     "card": {"карта", "номер карты"},
+    "station": {"то"},
+    "station_address": {"адрес то"},
     "operation": {"операция", "тип операции"},
 }
 _ALIASES = {name: {_header(alias) for alias in aliases} for name, aliases in _ALIASES.items()}
@@ -306,9 +308,10 @@ def _monthly_report(client, supplier, source_fuels, settings, audit):
 def _diesel_supplier_total(basis_by_type: dict, settings: dict, is_special: bool) -> Decimal:
     if is_special:
         return sum(basis_by_type.values(), Decimal(0)) * settings["virtual_diesel_multiplier"]
-    if set(basis_by_type) - {"virtual", "plastic"}:
+    from .gold import MULTIPLIERS
+    if set(basis_by_type) - {"virtual", "plastic", *MULTIPLIERS}:
         raise CalculationError("Тип дизельной карты не определён по скидке; требуется проверка")
-    return sum((basis * settings[f"{kind}_diesel_multiplier"]
+    return sum((basis * (MULTIPLIERS[kind] if kind in MULTIPLIERS else settings[f"{kind}_diesel_multiplier"])
                 for kind, basis in basis_by_type.items()), Decimal(0))
 
 
@@ -359,6 +362,12 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
             return calculate_weekly(rows, header_index, columns, client, kind, settings)
         if not _REQUIRED <= columns.keys():
             raise CalculationError("Не найден единственный лист с колонками Дата, Услуга, Количество, Стоимость ТО, Стоимость, Скидка %")
+        from .gold import START, card_rows, evidence_from_workbook, station_matches
+        card_evidence = {card: dict(kinds) for card, kinds in settings.get("card_evidence", {}).get(company_identity(client), {}).items()}
+        for card, kinds in evidence_from_workbook(workbook, {"name": Path(path).name}).items():
+            card_evidence.setdefault(card, {}).update(kinds)
+        cards_by_row = {number: card for number, _, card in card_rows(rows, columns, header_index + 1)}
+        gold_operations = []
         groups: dict[str, dict] = {}
         transaction_dates = []
         discount_types = set()
@@ -435,8 +444,21 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
                     row_card_type = "plastic"
                 else:
                     row_card_type = "unknown"
+                basis_type = row_card_type
+                if abs(discount - 4) <= settings["card_discount_tolerance"] and _company_key(client) not in {_company_key(name) for name in settings["special_clients"]}:
+                    if tx_date < START or not station_matches(cell("station") if "station" in columns else None,
+                                                              cell("station_address") if "station_address" in columns else None):
+                        raise CalculationError(f"Строка {index}: скидка 4% вне подтверждённых золотых АЗС или срока действия")
+                    evidence = card_evidence.get(cards_by_row.get(index), {})
+                    if len(evidence) != 1:
+                        raise CalculationError(f"Строка {index}: для золотой АЗС нужен однозначно подтверждённый тип карты")
+                    row_card_type = next(iter(evidence))
+                    basis_type = "gold_" + row_card_type
+                    gold_operations.append({"row": index, "card": cards_by_row[index], "card_type": row_card_type,
+                                            "evidence": evidence[row_card_type], "supplier_basis": str(amounts["supplier_basis"]),
+                                            "station": cell("station"), "date": tx_date.isoformat()})
                 discount_types.add(row_card_type)
-                diesel_basis_by_type[row_card_type] = diesel_basis_by_type.get(row_card_type, Decimal(0)) + amounts["supplier_basis"]
+                diesel_basis_by_type[basis_type] = diesel_basis_by_type.get(basis_type, Decimal(0)) + amounts["supplier_basis"]
         client_keys = {company_identity(value) for value in metadata_clients}
         if len(client_keys) > 1 or (client and client_keys and company_identity(client) not in client_keys):
             raise CalculationError("В файле указана другая фирма или несколько фирм; проверьте выгрузку")
@@ -490,7 +512,7 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
             "status": "ready" if fuels else "fully_reversed" if transaction_rows else "no_data",
             "fuels": fuels,
             "totals": {key: _litres(value) if key == "litres" else _money(value) for key, value in totals.items()},
-            "audit": {"sheet": sheet_name, "header_row": header_index + 1, "columns": {key: index + 1 for key, index in columns.items()}, "transaction_rows": transaction_rows, "skipped_summary_rows": skipped_summaries, "skipped_header_rows": skipped_headers, "skipped_metadata_rows": skipped_metadata, "fully_reversed_fuels": reversed_fuels, "date_from": min(transaction_dates).isoformat() if transaction_dates else None, "date_to": max(transaction_dates).isoformat() if transaction_dates else None, "special_client": is_special, "discount_types": sorted(discount_types), "raw_fuels": raw_fuels, "raw_totals": {key: str(value) for key, value in totals.items()}},
+            "audit": {"gold_operations": gold_operations, "sheet": sheet_name, "header_row": header_index + 1, "columns": {key: index + 1 for key, index in columns.items()}, "transaction_rows": transaction_rows, "skipped_summary_rows": skipped_summaries, "skipped_header_rows": skipped_headers, "skipped_metadata_rows": skipped_metadata, "fully_reversed_fuels": reversed_fuels, "date_from": min(transaction_dates).isoformat() if transaction_dates else None, "date_to": max(transaction_dates).isoformat() if transaction_dates else None, "special_client": is_special, "discount_types": sorted(discount_types), "raw_fuels": raw_fuels, "raw_totals": {key: str(value) for key, value in totals.items()}},
         }
     finally:
         workbook.close()

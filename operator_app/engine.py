@@ -395,6 +395,9 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
     monthly = _is_monthly(record)
     monthly_clients = _monthly_coverage(record, sources) if monthly else []
     calculation_rules = {**conf.get("rules", {})}
+    if not monthly:
+        from .gold import load_card_evidence
+        calculation_rules["card_evidence"] = load_card_evidence(DATA)
     if monthly:
         calculation_rules["report_month"] = record["plan"]["month"]
 

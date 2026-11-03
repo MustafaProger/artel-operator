@@ -35,8 +35,21 @@ def verify_page(page, company):
 def open_reports(page):
     # The cabinet's promotion toast can cover this button indefinitely. Use
     # its normal keyboard activation, which does not interact with the toast.
-    page.get_by_role("button", name="Отчёты", exact=True).press("Enter", timeout=60000)
-    page.get_by_role("button", name="Все отчёты", exact=True).wait_for(timeout=60000)
+    button = page.get_by_role("button", name="Отчёты", exact=True)
+    history = page.get_by_role("button", name="Все отчёты", exact=True)
+    # The button is visible before the cabinet finishes attaching its handlers.
+    # An early Enter can be ignored. Retry opening the menu, never generation,
+    # and check visibility first so an already open menu is not toggled closed.
+    for attempt in range(3):
+        if history.is_visible():
+            break
+        button.press("Enter", timeout=60000)
+        try:
+            history.wait_for(timeout=5000)
+            break
+        except PlaywrightTimeout:
+            if attempt == 2:
+                raise YandexError("Не удалось открыть список отчётов Яндекса. Созданный отчёт сохранён в кабинете; повторное создание не выполнялось.") from None
     wait_ready(page)
 
 

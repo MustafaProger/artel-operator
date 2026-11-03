@@ -137,3 +137,26 @@ def test_exact_download_under_overlay_preserves_rejected_source(tmp_path, conten
             assert page.get_by_role('button',name='Принять оферту',exact=True).is_visible()
         finally:
             browser.close()
+
+
+def test_reports_menu_retries_when_initial_activation_precedes_handlers():
+    from operator_app.yandex import open_reports
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content('''<button id="reports">Отчёты</button>
+              <button id="history" hidden>Все отчёты</button>
+              <script>
+              window.activations = 0;
+              reports.onclick = () => {
+                if (++window.activations > 1) document.getElementById('history').hidden = false;
+              };
+              </script>''')
+            open_reports(page)
+            assert page.get_by_role('button', name='Все отчёты', exact=True).is_visible()
+            assert page.evaluate('window.activations') == 2
+            open_reports(page)
+            assert page.evaluate('window.activations') == 2
+        finally:
+            browser.close()
