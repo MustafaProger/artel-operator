@@ -74,3 +74,29 @@ def test_evidence_manifest_is_hash_verified(tmp_path):
     p.write_bytes(b'changed')
     with pytest.raises(CalculationError, match='Изменился'):
         load_card_evidence(tmp_path)
+
+
+def test_hamlet_abbreviation_preserves_station_identity():
+    from operator_app.gold import station_matches
+    addr = 'Россия, Ростовская область, Миллеровский р-он, хут. Грай-Воронец, М-4 «Дон», 827 км, слева'
+    assert station_matches('АЗС ЛУКОЙЛ 61326', addr)
+    assert not station_matches('АЗС ЛУКОЙЛ 61326', addr.replace('слева', 'справа'))
+
+
+@pytest.mark.parametrize('refund_station,expected', [('Та же АЗС', True), ('Другая АЗС', False)])
+def test_rounded_refund_only_with_paired_purchase(tmp_path, refund_station, expected):
+    from datetime import datetime
+    day = datetime(2026, 11, 4, 11, 28, 44)
+    book = Workbook(); sheet = book.active
+    sheet.append(['Клиент','Дата','Услуга','Количество','Стоимость ТО','Стоимость','Скидка, %',
+                  'Карта','ТО','Адрес ТО','Цена ТО','Цена','Операция'])
+    sheet.append([CLIENT,day,'ДТ',200,16216,16540,-2,'123','Та же АЗС','Адрес',81.08,82.70,'Дебет'])
+    sheet.append([CLIENT,day,'ДТ',-0.01,-0.81,-0.83,-2.47,'123',refund_station,'Адрес',81.08,82.70,'Возврат'])
+    path = tmp_path / 'return.xlsx'; book.save(path)
+    if expected:
+        report = calculate_workbook(path)
+        assert report['audit']['paired_refunds'] == [{'row': 3, 'debit_row': 2, 'card_type': 'plastic'}]
+        assert report['fuels'][0]['customer_total'] == '16539.17'
+    else:
+        with pytest.raises(CalculationError):
+            calculate_workbook(path)

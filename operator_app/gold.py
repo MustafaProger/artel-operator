@@ -87,4 +87,5 @@ def _stations():
 
 def station_matches(name, address):
     from .calculator import _norm
-    return (_norm(name), _norm(address)) in _stations()
+    address = re.sub(r"(?<!\w)хут\.(?= )", "х.", _norm(address))
+    return (_norm(name), address) in _stations()

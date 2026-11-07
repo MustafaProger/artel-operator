@@ -35,7 +35,11 @@ def _period(rows, settings):
         first, last = monthly["date_from"], monthly["date_to"]
     elif settings.get("run_date"):
         run_date = _date(settings["run_date"], "плановая дата")
-        if settings.get("month_close_all_from") and run_date >= _date(settings["month_close_all_from"], "начало календаря"):
+        if settings.get("dated_activation_period"):
+            expected = tuple(_date(value, "разовый период") for value in settings["dated_activation_period"])
+            if len(expected) != 2 or expected[0] > expected[1] or expected[1] != run_date - timedelta(days=1):
+                raise CalculationError("Некорректный разовый период актирования")
+        elif settings.get("month_close_all_from") and run_date >= _date(settings["month_close_all_from"], "начало календаря"):
             from .config import monthly_weekly_period
             if run_date.weekday() != 1 and run_date.day != 1:
                 raise CalculationError("Эта фирма обрабатывается во вторник или при закрытии месяца")
@@ -47,7 +51,7 @@ def _period(rows, settings):
         if (first and first != expected[0]) or (last and last != expected[1]):
             raise CalculationError("Запрошенный период не соответствует плановому вторнику")
         first, last = expected
-    if not first or not last or (not settings.get("report_month") and not settings.get("month_close_all_from") and (first.weekday() != 1 or last - first != timedelta(days=6))):
+    if not first or not last or (not settings.get("report_month") and not settings.get("month_close_all_from") and not settings.get("dated_activation_period") and (first.weekday() != 1 or last - first != timedelta(days=6))):
         raise CalculationError("Нужен недельный период со вторника по понедельник")
     expected = (datetime.combine(first, time.min, MOSCOW), datetime.combine(last, time(23, 59, 59), MOSCOW))
     periods = []

@@ -251,3 +251,13 @@ def test_appending_report_is_idempotent_and_preserves_other_sections(tmp_path):
     assert existing.split("\n\n", 1)[1] in updated
     assert updated.index("### Китай") < updated.index('### ООО "ДРУГАЯ"')
     assert update_report_sections(updated, incoming) == updated
+
+
+def test_dated_friday_recovery_requires_matching_workbook_period(tmp_path):
+    rules = dict(run_date="2026-11-06", date_from="2026-11-01", date_to="2026-11-05",
+                 dated_activation_period=["2026-11-01", "2026-11-05"])
+    path = weekly_file(tmp_path / "china.xlsx", start="01.11.2026", end="05.11.2026")
+    assert calculate_workbook(path, rules)["weekly_kind"] == "china"
+    path = weekly_file(path, start="03.11.2026", end="05.11.2026")
+    with pytest.raises(CalculationError, match="Период внутри Excel"):
+        calculate_workbook(path, rules)

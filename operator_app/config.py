@@ -98,6 +98,24 @@ def parse_operator(markdown: str, expected_id: str | None = None) -> dict:
         except (TypeError, ValueError):
             raise ValueError("schedule.month_close_all_from: нужна дата и календарь закрытия топлива") from None
         schedule["month_close_all_from"] = value
+    if "all_firm_periods" in schedule:
+        overrides = schedule["all_firm_periods"]
+        if conf["kind"] != "glopro" or not isinstance(overrides, dict):
+            raise ValueError("all_firm_periods: нужны даты актирования GloPro")
+        normalized = {}
+        for slot, period in overrides.items():
+            try:
+                day = date.fromisoformat(str(slot))
+                if not isinstance(period, list) or len(period) != 2:
+                    raise ValueError()
+                start, end = (date.fromisoformat(str(value)) for value in period)
+                if (day.day == 1 or day.weekday() not in (1, 4) or not 0 <= (end - start).days < 7
+                        or end != day - timedelta(days=1) or start.replace(day=1) != end.replace(day=1)):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise ValueError("Разовый период GloPro: до семи завершённых дней одного месяца до даты актирования") from None
+            normalized[day.isoformat()] = [start.isoformat(), end.isoformat()]
+        schedule["all_firm_periods"] = normalized
     if "period_overrides" in schedule:
         overrides = schedule["period_overrides"]
         if conf["kind"] != "yandex" or not isinstance(overrides, dict):
@@ -306,6 +324,10 @@ def _plan_for(conf: dict, day: date) -> dict | None:
             weekly = monthly_weekly_period(day)
         if ordinary is None and weekly is not None:
             kind = "weekly_only"
+        override = conf["schedule"].get("all_firm_periods", {}).get(day.isoformat())
+        if override and ordinary is not None:
+            ordinary = weekly = tuple(map(date.fromisoformat, override))
+            kind = "all_firm_override"
         primary = ordinary or weekly
     elif conf["kind"] == "yandex":
         closing = all_month_close(conf, day) and day.day == 1

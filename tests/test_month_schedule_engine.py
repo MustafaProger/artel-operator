@@ -332,3 +332,19 @@ def test_legacy_friday_retry_remains_available_after_days_change(month_engine):
     assert plan["ordinary_period"] == ["2026-09-22", "2026-09-24"]
     assert plan["weekly_period"] is None
     assert storage.get_run(old["id"]) == old
+
+
+def test_dated_recovery_only_overlaps_failed_login(month_engine, monkeypatch):
+    _, operators, _ = month_engine
+    raw = (operators / "glopro.md").read_text().replace(
+        "  days: [tue, fri]", "  days: [tue, fri]\n  all_firm_periods:\n"
+        "    '2026-11-06': ['2026-11-01', '2026-11-05']")
+    conf = config.parse_operator(raw)
+    previous = dict(run_date="2026-11-03", status="failed", plan=config.run_plan(conf, date(2026, 11, 3)),
+                    events=[{"stage": "connecting"}], files=[{"name": "Инструкция.md"}])
+    monkeypatch.setattr(storage, "operator_runs", lambda *args: [previous])
+    plan = engine.plan_run(conf, date(2026, 11, 6))
+    assert plan["ordinary_period"] == plan["weekly_period"] == ["2026-11-01", "2026-11-05"]
+    previous["events"].append({"stage": "downloaded"})
+    with pytest.raises(ValueError, match="пересекается"):
+        engine.plan_run(conf, date(2026, 11, 6))

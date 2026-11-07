@@ -10,6 +10,9 @@ schedule:
   month_close_all_from: '2026-09-29'
   month_boundary: close_previous_month
   month_boundary_from: '2026-09-29'
+  all_firm_periods:
+    '2026-11-06': ['2026-11-01', '2026-11-05']
+    '2026-11-10': ['2026-11-06', '2026-11-09']
 supplier: Новое имя
 obsidian_output: "/Users/mustafa/Library/Mobile Documents/iCloud~md~obsidian/Documents/Заметки/Работа"
 clients: []

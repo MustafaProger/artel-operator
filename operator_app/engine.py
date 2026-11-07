@@ -149,15 +149,24 @@ def plan_run(conf, day):
     if same_day:
         return _legacy_plan(conf, day, same_day[0])
     plan = run_plan(conf, day)
-    ordinary = plan.get("ordinary_period")
-    if ordinary and conf["schedule"].get("month_boundary"):
+    dated = (plan.get("calendar_periods") or {}).get("kind") == "all_firm_override"
+    keys = ("ordinary_period", "weekly_period") if dated else ("ordinary_period",)
+    if dated or (plan.get("ordinary_period") and conf["schedule"].get("month_boundary")):
         for previous in history:
+            # Only a dated recovery may cover a failed login which never reached
+            # client discovery, downloaded sources, or produced an output.
+            if (dated and previous["status"] == "failed"
+                    and [e.get("stage") for e in previous.get("events", [])] == ["connecting"]
+                    and [f.get("name") for f in previous.get("files", [])] == ["Инструкция.md"]
+                    and not previous.get("report")):
+                continue
             old_plan = previous.get("plan") or _legacy_plan(conf, date.fromisoformat(previous["run_date"]), previous)
-            old = old_plan.get("ordinary_period")
-            if old and ordinary[0] <= old[1] and old[0] <= ordinary[1]:
-                raise ValueError(f"Период {ordinary[0]} — {ordinary[1]} пересекается с сохранённым запуском "
-                                 f"{previous['run_date']} ({old[0]} — {old[1]}). Повторите сохранённую дату; "
-                                 "изменение календаря требует сверки уже обработанных периодов.")
+            for key in keys:
+                period, old = plan.get(key), old_plan.get(key)
+                if period and old and period[0] <= old[1] and old[0] <= period[1]:
+                    raise ValueError(f"Период {period[0]} — {period[1]} пересекается с сохранённым запуском "
+                                     f"{previous['run_date']} ({old[0]} — {old[1]}). Повторите сохранённую дату; "
+                                     "изменение календаря требует сверки уже обработанных периодов.")
     return plan
 
 
@@ -439,6 +448,8 @@ def process_glopro(conf, record, sources, root, progress, *, imported=False):
                      "client": client, "client_id": source.get("client_id")}
             if record.get("plan", {}).get("month_close_all_from"):
                 rules["month_close_all_from"] = record["plan"]["month_close_all_from"]
+            if (record.get("plan") or {}).get("calendar_periods", {}).get("kind") == "all_firm_override":
+                rules["dated_activation_period"] = record["plan"]["weekly_period"]
             report = calculate_workbook(source["path"], rules)
             source["client"] = report["client"]
             report["period"] = [period[0].isoformat(), period[1].isoformat()]

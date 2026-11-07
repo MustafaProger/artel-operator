@@ -10,6 +10,7 @@ schedule:
   month_close_all_from: '2026-09-29'
   period_overrides:
     '2026-10-20': ['2026-10-06', '2026-10-19']
+    '2026-11-10': ['2026-11-06', '2026-11-09']
 company: ООО НК АРТЭЛЬ
 obsidian_output: "/Users/mustafa/Library/Mobile Documents/iCloud~md~obsidian/Documents/Заметки/Работа"
 # Только согласованные подписи; это не список выгрузки.

@@ -368,6 +368,10 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
             card_evidence.setdefault(card, {}).update(kinds)
         cards_by_row = {number: card for number, _, card in card_rows(rows, columns, header_index + 1)}
         gold_operations = []
+        refund_matches = []
+        price_cols = {label: idx for idx, value in enumerate(rows[header_index])
+                      if (label := _norm(value)) in {"цена то", "цена"}}
+        last_debit = None
         groups: dict[str, dict] = {}
         transaction_dates = []
         discount_types = set()
@@ -444,6 +448,28 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
                     row_card_type = "plastic"
                 else:
                     row_card_type = "unknown"
+                # A one-hundredth litre refund may display a distorted percentage
+                # because both totals are rounded to kopecks. Require its paired
+                # debit and exact agreement with the original unit prices.
+                pair = None
+                if (cards_by_row.get(index) and {"station", "station_address", "operation"} <= columns.keys()
+                        and len(price_cols) == 2 and isinstance(cell("date"), datetime)
+                        and cell("station") and cell("station_address")):
+                    unit = tuple(row[price_cols[k]] for k in ("цена то", "цена"))
+                    pair = (cards_by_row[index], cell("date"), cell("service"), cell("station"), cell("station_address"), unit)
+                if (row_card_type == "unknown" and amounts["litres"] == Decimal("-0.01")
+                        and pair and _norm(cell("operation")) == "возврат" and last_debit
+                        and last_debit[:2] == (index - 1, pair)
+                        and all((_decimal(price, "цена") * amounts["litres"]).quantize(Decimal(".01"), rounding=ROUND_HALF_UP)
+                                == amounts[key] for price, key in zip(unit, ("supplier_basis", "customer_total")))
+                        and amounts["supplier_basis"] < 0 and discount < 0
+                        and ((1 - amounts["customer_total"] / amounts["supplier_basis"]) * 100)
+                            .quantize(Decimal(".01"), rounding=ROUND_HALF_UP) == discount):
+                    row_card_type = last_debit[2]
+                    refund_matches.append({"row": index, "debit_row": index - 1, "card_type": row_card_type})
+                if (pair and row_card_type in {"virtual", "plastic"} and amounts["litres"] > 0
+                        and _norm(cell("operation")) == "дебет"):
+                    last_debit = (index, pair, row_card_type)
                 basis_type = row_card_type
                 if abs(discount - 4) <= settings["card_discount_tolerance"] and _company_key(client) not in {_company_key(name) for name in settings["special_clients"]}:
                     if tx_date < START or not station_matches(cell("station") if "station" in columns else None,
@@ -512,7 +538,7 @@ def calculate_workbook(path: str | Path, rules: dict | None = None) -> dict:
             "status": "ready" if fuels else "fully_reversed" if transaction_rows else "no_data",
             "fuels": fuels,
             "totals": {key: _litres(value) if key == "litres" else _money(value) for key, value in totals.items()},
-            "audit": {"gold_operations": gold_operations, "sheet": sheet_name, "header_row": header_index + 1, "columns": {key: index + 1 for key, index in columns.items()}, "transaction_rows": transaction_rows, "skipped_summary_rows": skipped_summaries, "skipped_header_rows": skipped_headers, "skipped_metadata_rows": skipped_metadata, "fully_reversed_fuels": reversed_fuels, "date_from": min(transaction_dates).isoformat() if transaction_dates else None, "date_to": max(transaction_dates).isoformat() if transaction_dates else None, "special_client": is_special, "discount_types": sorted(discount_types), "raw_fuels": raw_fuels, "raw_totals": {key: str(value) for key, value in totals.items()}},
+            "audit": {"paired_refunds": refund_matches, "gold_operations": gold_operations, "sheet": sheet_name, "header_row": header_index + 1, "columns": {key: index + 1 for key, index in columns.items()}, "transaction_rows": transaction_rows, "skipped_summary_rows": skipped_summaries, "skipped_header_rows": skipped_headers, "skipped_metadata_rows": skipped_metadata, "fully_reversed_fuels": reversed_fuels, "date_from": min(transaction_dates).isoformat() if transaction_dates else None, "date_to": max(transaction_dates).isoformat() if transaction_dates else None, "special_client": is_special, "discount_types": sorted(discount_types), "raw_fuels": raw_fuels, "raw_totals": {key: str(value) for key, value in totals.items()}},
         }
     finally:
         workbook.close()
